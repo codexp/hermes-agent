@@ -228,6 +228,93 @@ class TestChannelSessionScopeShared:
         )
 
 
+class TestChannelSessionScopeMarkerMode:
+    """``reply_in_thread: marker`` only threads top-level channel messages
+    when the prompt explicitly asks for a thread.  Marker parsing is tolerant
+    of Slack emoji markup and missing whitespace so users can type naturally.
+    """
+
+    @pytest.mark.asyncio
+    async def test_top_level_without_marker_uses_channel_session(self, adapter):
+        adapter.config.extra["reply_in_thread"] = "marker"
+        event = _channel_event(
+            "<@U_BOT> hello",
+            ts="1700000000.000020",
+        )
+
+        captured = []
+        adapter.handle_message = AsyncMock(side_effect=lambda e: captured.append(e))
+        with patch.object(
+            adapter,
+            "_resolve_user_name",
+            new=AsyncMock(return_value="testuser"),
+        ):
+            await adapter._handle_slack_message(event)
+
+        assert len(captured) == 1
+        assert captured[0].source.thread_id is None
+        assert captured[0].reply_to_message_id is None
+        assert captured[0].text == "hello"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("prompt", "expected_text"),
+        [
+            (":thread: <@U_BOT> Thread reply", "Thread reply"),
+            (":thread:<@U_BOT> Thread reply", "Thread reply"),
+            ("<@U_BOT> :thread: Thread reply", "Thread reply"),
+            ("<@U_BOT> :thread:Thread reply", "Thread reply"),
+            ("🧵 <@U_BOT> Thread reply", "Thread reply"),
+            ("🧵<@U_BOT> Thread reply", "Thread reply"),
+            ("<@U_BOT> 🧵 Thread reply", "Thread reply"),
+            ("<@U_BOT> 🧵Thread reply", "Thread reply"),
+            ("<@U_BOT> Thread reply (thread)", "Thread reply"),
+        ],
+    )
+    async def test_thread_marker_threads_and_strips_marker(
+        self, adapter, prompt, expected_text
+    ):
+        adapter.config.extra["reply_in_thread"] = "marker"
+        event = _channel_event(
+            prompt,
+            ts="1700000000.000021",
+        )
+
+        captured = []
+        adapter.handle_message = AsyncMock(side_effect=lambda e: captured.append(e))
+        with patch.object(
+            adapter,
+            "_resolve_user_name",
+            new=AsyncMock(return_value="testuser"),
+        ):
+            await adapter._handle_slack_message(event)
+
+        assert len(captured) == 1
+        assert captured[0].source.thread_id == "1700000000.000021"
+        assert captured[0].reply_to_message_id is None
+        assert captured[0].text == expected_text
+
+    @pytest.mark.asyncio
+    async def test_bare_thread_marker_in_free_response_channel_is_title_only(
+        self, adapter
+    ):
+        adapter.config.extra["reply_in_thread"] = "marker"
+        adapter.config.extra["free_response_channels"] = ["C_CHAN"]
+        event = _channel_event(
+            ":thread: Hermes Core patches",
+            ts="1700000000.000022",
+        )
+
+        with patch.object(
+            adapter,
+            "_resolve_user_name",
+            new=AsyncMock(return_value="testuser"),
+        ):
+            await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_awaited()
+
+
 class TestThreadReplyAlwaysScopesByThread:
     """Cross-cutting invariant: genuine thread replies always scope by
     ``thread_ts`` regardless of ``reply_in_thread``.  If this ever
