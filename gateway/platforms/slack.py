@@ -2157,6 +2157,7 @@ class SlackAdapter(BasePlatformAdapter):
             user_id=user_id,
             thread_id=thread_ts,
             chat_topic=metadata.get("context_channel_id") or None,
+            guild_id=metadata.get("team_id") or None,
         )
 
         try:
@@ -2313,14 +2314,18 @@ class SlackAdapter(BasePlatformAdapter):
                 pass
 
         text = original_text
+        is_command_text = original_text.startswith("/")
 
         # Extract quoted/forwarded content from Slack blocks.
         # Slack's modern composer embeds forwarded messages in the ``blocks``
         # array as ``rich_text_quote`` elements, which are NOT reflected in
         # the plain ``text`` field.  Merge block text so the agent sees the
-        # full message content.
+        # full message content. Do not enrich commands: for ``!command`` we
+        # already rewrote the text to ``/command``, while Slack blocks still
+        # contain the original ``!command`` text. Appending that block text
+        # makes command handlers see their own raw command as an argument.
         blocks = event.get("blocks")
-        if blocks:
+        if blocks and not is_command_text:
             blocks_text = _extract_text_from_slack_blocks(blocks)
             if blocks_text:
                 # Only append if the blocks contain text not already present
@@ -2342,8 +2347,10 @@ class SlackAdapter(BasePlatformAdapter):
         # Slack places unfurled link previews in the ``attachments`` array with
         # fields like title, title_link/from_url, text, footer, and fallback.
         # Without reading these, the agent never sees shared link previews.
+        # For commands, keep the argument stream exact; unfurls often duplicate
+        # URLs in Markdown form and corrupt low-level command parsing.
         slack_attachments = event.get("attachments") or []
-        if slack_attachments:
+        if slack_attachments and not is_command_text:
             att_parts: list[str] = []
             for att in slack_attachments:
                 att_title = att.get("title", "")
@@ -2794,6 +2801,7 @@ class SlackAdapter(BasePlatformAdapter):
             user_id=user_id,
             user_name=user_name,
             thread_id=thread_ts,
+            guild_id=team_id,
         )
 
         # Per-channel ephemeral prompt
@@ -3548,6 +3556,7 @@ class SlackAdapter(BasePlatformAdapter):
             chat_id=channel_id,
             chat_type="dm" if is_dm else "group",
             user_id=user_id,
+            guild_id=team_id or None,
         )
 
         event = MessageEvent(

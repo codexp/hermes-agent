@@ -243,6 +243,293 @@ class GatewaySlashCommandsMixin:
 
         return "\n".join(lines)
 
+    @staticmethod
+    def _clean_subject_agent_output(text: str) -> str:
+        """Extract clean Markdown from the subject-preprocessor response."""
+        text = (text or "").strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        return text.rstrip() + "\n" if text.strip() else ""
+
+    @staticmethod
+    def _subject_card_is_safe(content: str) -> bool:
+        """Validate minimal Gateway Context Card shape from the preprocessor."""
+        stripped = (content or "").strip()
+        if not stripped or not stripped.startswith("# "):
+            return False
+        banned = ("<script", "```", "<!--", "</")
+        return not any(token in stripped.lower() for token in banned)
+
+    async def _preprocess_subject_card_with_agent(
+        self,
+        event: MessageEvent,
+        description: str,
+        fallback_content: str,
+    ) -> str:
+        """Use the session model to turn a raw /subject set string into card Markdown.
+
+        The low-level context script only writes bytes to the deterministic scope path.
+        It must not own language judgment. This gateway layer asks the current
+        agent/model to fix typos, grammar, and tiny wording issues while keeping
+        the user's meaning and the final card concise.
+        """
+        # Tests can inject an exact preprocessor without hitting a real model.
+        override = getattr(self, "_subject_preprocess_override", None)
+        if override is not None:
+            maybe = override(description, fallback_content)
+            if inspect.isawaitable(maybe):
+                maybe = await maybe
+            cleaned = self._clean_subject_agent_output(str(maybe or ""))
+            return cleaned if self._subject_card_is_safe(cleaned) else fallback_content
+
+        if not hasattr(self, "_resolve_session_agent_runtime"):
+            return fallback_content
+
+        try:
+            from run_agent import AIAgent
+
+            source = event.source
+            session_key_func = getattr(self, "_session_key_for_source", None)
+            session_key = session_key_func(source) if session_key_func else None
+            resolve_runtime = getattr(self, "_resolve_session_agent_runtime", None)
+            if resolve_runtime is None:
+                return fallback_content
+            model, runtime_kwargs = resolve_runtime(
+                source=source,
+                session_key=session_key,
+            )
+            if not model or not runtime_kwargs.get("api_key"):
+                return fallback_content
+
+            prompt = (
+                "You preprocess a Hermes Gateway Context Card subject.\n"
+                "Return ONLY Markdown for one concise card, no explanation and no code fence.\n"
+                "Rules:\n"
+                "- Correct obvious typos and grammar.\n"
+                "- Optimize slightly for future agent use.\n"
+                "- Preserve meaning. Do not invent facts, do not broaden scope.\n"
+                "- Keep the subject and metadata as concise as possible.\n"
+                "- First line must be a level-1 Markdown heading.\n"
+                "- Put typed anchors under an `Anchor:` block. Supported anchors: jira:, github:, path:, home:.\n"
+                "- Normalize home: anchors to path:.\n"
+                "- If the input is only `jira:KEY`, use `# KEY` and `Anchor: - jira:KEY`.\n"
+                "- Do not include internal file paths unless the user provided them as anchors.\n\n"
+                f"Raw /subject set input:\n{description}\n\n"
+                f"Deterministic fallback card for reference:\n{fallback_content}"
+            )
+            tmp_agent = AIAgent(
+                **runtime_kwargs,
+                model=model,
+                max_iterations=1,
+                quiet_mode=True,
+                enabled_toolsets=[],
+                skip_context_files=True,
+                skip_memory=True,
+                platform=(source.platform.value if source and source.platform else "gateway"),
+                user_id=(source.user_id if source else "") or "",
+                chat_id=(source.chat_id if source else "") or "",
+                chat_type=(source.chat_type if source else "") or "",
+                thread_id=(source.thread_id if source else "") or "",
+                session_id="",
+            )
+            try:
+                setattr(tmp_agent, "_print_fn", lambda *a, **kw: None)
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: tmp_agent.chat(prompt),
+                )
+            finally:
+                cleanup = getattr(self, "_cleanup_agent_resources", None)
+                if cleanup:
+                    cleanup(tmp_agent)
+            cleaned = self._clean_subject_agent_output(str(result or ""))
+            return cleaned if self._subject_card_is_safe(cleaned) else fallback_content
+        except Exception as exc:
+            logger.warning("/subject set agent preprocessing failed, using deterministic fallback: %s", exc)
+            return fallback_content
+
+    async def _handle_subject_command(self, event: MessageEvent) -> str:
+        """Handle /subject for Gateway Context Cards.
+
+        Gateway owns the user-facing command behavior. The script at
+        ~/.hermes/gateway-context/script/context owns deterministic path
+        resolution and file writes.
+        """
+        import subprocess
+
+        source = event.source
+        args = shlex.split(event.get_command_args().strip()) if event.get_command_args().strip() else []
+        if not args:
+            args = ["get"]
+        sub = args[0].lower()
+        rest = args[1:]
+
+        platform = source.platform.value if source.platform else "local"
+        # Workspace scopes must not fall back to the channel ID. Slack events
+        # normally provide ``guild_id`` as the team/workspace ID, but some
+        # command/session paths may not have it. Use a deterministic fallback
+        # instead of duplicating ``<channel>/<channel>`` in the storage path.
+        workspace_id = source.guild_id or "_default"
+        channel_id = source.parent_chat_id or source.chat_id or "default"
+        thread_id = source.thread_id
+        scope_args = [platform, str(workspace_id), str(channel_id)]
+        if thread_id:
+            scope_args.append(str(thread_id))
+
+        from hermes_constants import get_hermes_home
+
+        script = get_hermes_home() / "gateway-context" / "script" / "context"
+        if not script.exists():
+            return f"Gateway context script not found: `{script}`"
+
+        def _run_context(cmd_args: list[str], *, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+            env = os.environ.copy()
+            env["HERMES_HOME"] = str(get_hermes_home())
+            env.pop("HERMES_GATEWAY_CONTEXT_HOME", None)
+            return subprocess.run(
+                [str(script), *cmd_args],
+                input=input_text,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                check=False,
+                env=env,
+            )
+
+        def _code_fence(text: str) -> str:
+            text = (text or "").rstrip()
+            return f"```md\n{text}\n```" if text else "```md\n\n```"
+
+        def _normalize_description(text: str) -> str:
+            # Keep v0 conservative: trim whitespace and collapse spaces. Do not
+            # expand terse user wording. Future agent-side preprocessing can do
+            # richer grammar fixes before calling the low-level script.
+            return re.sub(r"\\s+", " ", text.strip())
+
+        def _card_from_description(description: str) -> str:
+            desc = _normalize_description(description)
+            jira = re.fullmatch(r"[A-Z][A-Z0-9]+-\d+", desc)
+            if jira:
+                key = jira.group(0)
+                return f"# {key}\n\nAnchor:\n  - jira:{key}\n"
+
+            anchors: list[str] = []
+            title_parts: list[str] = []
+            last = 0
+            for match in re.finditer(r"\b(jira|github|path|home):(\S+)", desc):
+                before = desc[last:match.start()].strip()
+                if before:
+                    title_parts.append(before)
+                kind = match.group(1).lower()
+                value = match.group(2).strip()
+                anchor_kind = "path" if kind == "home" else kind
+                anchor = f"{anchor_kind}:{value}"
+                if anchor not in anchors:
+                    anchors.append(anchor)
+                last = match.end()
+            tail = desc[last:].strip()
+            if tail:
+                title_parts.append(tail)
+
+            title = _normalize_description(" ".join(title_parts))
+            if not title and len(anchors) == 1:
+                jira_anchor = re.fullmatch(r"jira:([A-Z][A-Z0-9]+-\d+)", anchors[0])
+                if jira_anchor:
+                    title = jira_anchor.group(1)
+            if not title:
+                title = desc
+            content = f"# {title}\n" if title else ""
+            if anchors:
+                content = content.rstrip() + "\n\nAnchor:\n" + "\n".join(f"  - {a}" for a in anchors) + "\n"
+            return content
+
+        def _anchor_from_line(line: str) -> str | None:
+            line = _normalize_description(line)
+            if re.fullmatch(r"[A-Z][A-Z0-9]+-\d+", line):
+                return f"jira:{line}"
+            if re.match(r"^(jira|github|path):\S+", line):
+                return line
+            if re.match(r"^home:\S+", line):
+                return "path:" + line.split(":", 1)[1]
+            return None
+
+        def _add_to_card(existing: str, line: str) -> str:
+            line = _normalize_description(line)
+            if not line:
+                return existing.rstrip() + "\n"
+            existing = (existing or "").rstrip()
+            if not existing:
+                existing = _card_from_description(line).rstrip()
+                return existing + "\n"
+            anchor = _anchor_from_line(line)
+            lines = existing.splitlines()
+            if anchor:
+                anchor_item = f"  - {anchor}"
+                if any(l.strip() == f"- {anchor}" for l in lines):
+                    return existing + "\n"
+                anchor_idx = next((i for i, l in enumerate(lines) if l.strip() == "Anchor:"), None)
+                if anchor_idx is None:
+                    if lines and lines[-1].strip():
+                        lines.append("")
+                    lines.extend(["Anchor:", anchor_item])
+                    return "\n".join(lines).rstrip() + "\n"
+                insert_at = anchor_idx + 1
+                while insert_at < len(lines) and (lines[insert_at].startswith("  - ") or not lines[insert_at].strip()):
+                    if not lines[insert_at].strip():
+                        break
+                    insert_at += 1
+                lines.insert(insert_at, anchor_item)
+                return "\n".join(lines).rstrip() + "\n"
+            if any(l.strip() == line for l in lines):
+                return existing + "\n"
+            lines.append(line)
+            return "\n".join(lines).rstrip() + "\n"
+
+        if sub == "get":
+            scope_only = "--scope" in rest
+            cmd = ["get"] + (["--scope"] if scope_only else []) + scope_args
+            proc = await asyncio.to_thread(_run_context, cmd)
+            if proc.returncode != 0:
+                return f"/subject get failed: `{(proc.stderr or proc.stdout).strip()}`"
+            return _code_fence(proc.stdout)
+
+        if sub == "set":
+            description = " ".join(rest).strip()
+            if not description:
+                return "Usage: /subject set <description>"
+            fallback_content = _card_from_description(description)
+            content = await self._preprocess_subject_card_with_agent(
+                event,
+                description,
+                fallback_content,
+            )
+            proc = await asyncio.to_thread(_run_context, ["set", *scope_args, "--", content])
+            if proc.returncode != 0:
+                return f"/subject set failed: `{(proc.stderr or proc.stdout).strip()}`"
+            return _code_fence(content)
+
+        if sub == "add":
+            line = " ".join(rest).strip()
+            if not line:
+                return "Usage: /subject add <line>"
+            get_proc = await asyncio.to_thread(_run_context, ["get", "--scope", *scope_args])
+            if get_proc.returncode != 0:
+                return f"/subject add failed: `{(get_proc.stderr or get_proc.stdout).strip()}`"
+            content = _add_to_card(get_proc.stdout, line)
+            set_proc = await asyncio.to_thread(_run_context, ["set", *scope_args, "--", content])
+            if set_proc.returncode != 0:
+                return f"/subject add failed: `{(set_proc.stderr or set_proc.stdout).strip()}`"
+            return _code_fence(content)
+
+        return "Usage: /subject [get [--scope] | set <description> | add <line>]"
+
     async def _handle_whoami_command(self, event: MessageEvent) -> str:
         """Handle /whoami — show the user's slash command access on this scope.
 

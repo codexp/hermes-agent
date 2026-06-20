@@ -69,6 +69,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                aliases=("reset",), args_hint="[name]"),
     CommandDef("topic", "Enable or inspect Telegram DM topic sessions", "Session",
                gateway_only=True, args_hint="[off|help|session-id]"),
+    CommandDef("subject", "Manage Gateway Context Cards for this channel or thread", "Session",
+               gateway_only=True, args_hint="[get [--scope]|set <description>|add <line>]",
+               subcommands=("get", "set", "add")),
     CommandDef("clear", "Clear screen and start a new session", "Session",
                cli_only=True),
     CommandDef("redraw", "Force a full UI repaint (recovers from terminal drift)", "Session",
@@ -361,6 +364,7 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
         "status",
         "steer",
         "stop",
+        "subject",
         "update",
         "version",
     }
