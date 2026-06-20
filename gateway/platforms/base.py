@@ -3211,12 +3211,30 @@ class BasePlatformAdapter(ABC):
             # _keep_typing may have called send_typing() after an outer
             # stop_typing() cleared the task dict, recreating the loop.
             # Cancelling _keep_typing alone won't clean that up.
-            if hasattr(self, "stop_typing"):
-                try:
-                    await self.stop_typing(chat_id)
-                except Exception:
-                    pass
+            await self._call_stop_typing(chat_id, metadata=metadata)
             self._typing_paused.discard(chat_id)
+
+    async def _call_stop_typing(self, chat_id: str, metadata=None) -> None:
+        """Call adapter stop_typing with metadata when the adapter supports it."""
+        if not hasattr(self, "stop_typing"):
+            return
+        stop_fn = getattr(self, "stop_typing")
+        try:
+            sig = inspect.signature(stop_fn)
+        except (TypeError, ValueError):
+            sig = None
+        try:
+            if sig is not None:
+                params = sig.parameters
+                if "metadata" in params or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD
+                    for p in params.values()
+                ):
+                    await stop_fn(chat_id, metadata=metadata)
+                    return
+            await stop_fn(chat_id)
+        except Exception:
+            pass
 
     async def _stop_typing_refresh(
         self,
@@ -3225,6 +3243,7 @@ class BasePlatformAdapter(ABC):
         *,
         timeout: float = 0.5,
         stop_attempts: int = 2,
+        metadata=None,
     ) -> None:
         """Stop the refresh task and platform typing state as one operation."""
         self._typing_paused.add(chat_id)
@@ -3237,14 +3256,9 @@ class BasePlatformAdapter(ABC):
                     # The task is cancelled; don't let a slow adapter-specific
                     # cleanup block response delivery or shutdown.
                     pass
-            if not hasattr(self, "stop_typing"):
-                return
             attempts = max(1, stop_attempts)
             for attempt in range(attempts):
-                try:
-                    await self.stop_typing(chat_id)
-                except Exception:
-                    pass
+                await self._call_stop_typing(chat_id, metadata=metadata)
                 if attempt < attempts - 1:
                     await asyncio.sleep(0)
         finally:
@@ -4182,6 +4196,7 @@ class BasePlatformAdapter(ABC):
             await self._stop_typing_refresh(
                 event.source.chat_id,
                 typing_task,
+                metadata=_thread_metadata,
             )
         
         try:
@@ -4603,6 +4618,7 @@ class BasePlatformAdapter(ABC):
                 event.source.chat_id,
                 None,
                 stop_attempts=1,
+                metadata=_thread_metadata,
             )
             # Final drain/release boundary: force-flush any timer that missed
             # the in-band drain before deciding whether the guard can clear.
