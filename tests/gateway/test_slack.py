@@ -1161,6 +1161,40 @@ class TestBangPrefixCommands:
         assert msg_event.message_type == MessageType.COMMAND
 
     @pytest.mark.asyncio
+    async def test_bang_command_does_not_append_blocks_or_unfurls(self, adapter):
+        """Command args stay exact even when Slack sends blocks/unfurls."""
+        event = self._make_event("!subject set Shop home:~/devel/shop jira:https://jira.example/FB2B")
+        event["blocks"] = [
+            {
+                "type": "rich_text",
+                "elements": [
+                    {
+                        "type": "rich_text_section",
+                        "elements": [
+                            {"type": "text", "text": "!subject set Shop home:~/devel/shop jira:"},
+                            {"type": "link", "url": "https://jira.example/FB2B"},
+                        ],
+                    }
+                ],
+            }
+        ]
+        event["attachments"] = [
+            {
+                "title": "FB2B",
+                "title_link": "https://jira.example/FB2B",
+                "text": "Jira project preview",
+            }
+        ]
+
+        await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text == "/subject set Shop home:~/devel/shop jira:https://jira.example/FB2B"
+        assert "!subject" not in msg_event.text
+        assert "Jira project preview" not in msg_event.text
+        assert msg_event.message_type == MessageType.COMMAND
+
+    @pytest.mark.asyncio
     async def test_bang_works_inside_thread(self, adapter):
         """The whole point: ``!stop`` inside a thread reply dispatches."""
         evt = self._make_event("!stop", thread_ts="1111111111.000001")

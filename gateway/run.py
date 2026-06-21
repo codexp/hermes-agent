@@ -7715,6 +7715,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return await self._handle_commands_command(event)
                 if _cmd_def_inner.name == "profile":
                     return await self._handle_profile_command(event)
+                if _cmd_def_inner.name == "subject":
+                    return await self._handle_subject_command(event)
                 if _cmd_def_inner.name == "update":
                     return await self._handle_update_command(event)
                 if _cmd_def_inner.name == "version":
@@ -7963,6 +7965,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "topic":
             return await self._handle_topic_command(event)
+
+        if canonical == "subject":
+            return await self._handle_subject_command(event)
         
         if canonical == "help":
             return await self._handle_help_command(event)
@@ -15119,9 +15124,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
             platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
             
-            # Combine platform context, per-channel context, and the user-configured
-            # ephemeral system prompt.
+            # Combine platform context, gateway-context-card bundle, per-channel
+            # context, and the user-configured ephemeral system prompt.
             combined_ephemeral = context_prompt or ""
+            try:
+                from hermes_constants import get_hermes_home as _get_hermes_home
+                import subprocess as _subprocess
+                _gcc_script = _get_hermes_home() / "gateway-context" / "script" / "context"
+                if _gcc_script.exists():
+                    _gcc_platform = source.platform.value if source.platform else "local"
+                    # Workspace scopes must not fall back to the channel ID.
+                    # If a platform event lacks a workspace/server ID, keep the
+                    # path explicit with a deterministic fallback.
+                    _gcc_workspace = source.guild_id or "_default"
+                    _gcc_channel = source.parent_chat_id or source.chat_id or "default"
+                    _gcc_args = [str(_gcc_script), "get", str(_gcc_platform), str(_gcc_workspace), str(_gcc_channel)]
+                    if source.thread_id:
+                        _gcc_args.append(str(source.thread_id))
+                    _gcc_env = os.environ.copy()
+                    _gcc_env["HERMES_HOME"] = str(_get_hermes_home())
+                    _gcc_env.pop("HERMES_GATEWAY_CONTEXT_HOME", None)
+                    _gcc_proc = _subprocess.run(
+                        _gcc_args,
+                        stdout=_subprocess.PIPE,
+                        stderr=_subprocess.DEVNULL,
+                        text=True,
+                        timeout=2,
+                        check=False,
+                        env=_gcc_env,
+                    )
+                    _gcc_bundle = (_gcc_proc.stdout or "").strip() if _gcc_proc.returncode == 0 else ""
+                    if _gcc_bundle:
+                        combined_ephemeral = (
+                            combined_ephemeral
+                            + "\n\nGateway Context Cards (resolved):\n"
+                            + _gcc_bundle
+                        ).strip()
+            except Exception:
+                logger.debug("Gateway context card resolution failed", exc_info=True)
             event_channel_prompt = (channel_prompt or "").strip()
             if event_channel_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
