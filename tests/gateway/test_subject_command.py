@@ -53,20 +53,20 @@ def _event(text: str, *, thread_id: str | None = "1781871116.838719") -> Message
 async def test_subject_set_jira_key_creates_thread_card(hermes_home):
     result = await SubjectHarness()._handle_subject_command(_event("/subject set MODS-12345"))
 
-    assert result == "```md\n# MODS-12345\n\nAnchor:\n  - jira:MODS-12345\n```"
+    assert result == "```md\n# MODS-12345\n\nResources:\n  - jira:MODS-12345\n```"
     card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "1781871116.838719.md"
-    assert card.read_text() == "# MODS-12345\n\nAnchor:\n  - jira:MODS-12345\n"
+    assert card.read_text() == "# MODS-12345\n\nResources:\n  - jira:MODS-12345\n"
 
 
 @pytest.mark.asyncio
-async def test_subject_set_typed_jira_anchor_uses_issue_key_title(hermes_home):
+async def test_subject_set_typed_jira_resource_uses_issue_key_title(hermes_home):
     result = await SubjectHarness()._handle_subject_command(_event("/subject set jira:FB2B-1812"))
 
-    assert result == "```md\n# FB2B-1812\n\nAnchor:\n  - jira:FB2B-1812\n```"
+    assert result == "```md\n# FB2B-1812\n\nResources:\n  - jira:FB2B-1812\n```"
 
 
 @pytest.mark.asyncio
-async def test_subject_set_extracts_inline_anchors(hermes_home):
+async def test_subject_set_extracts_inline_resources(hermes_home):
     result = await SubjectHarness()._handle_subject_command(
         _event("/subject set FALKE B2B Shop development channel home:~/devel/falke-b2b-shop/ jira:https://evenonsunday.atlassian.net/jira/software/c/projects/FB2B")
     )
@@ -74,7 +74,7 @@ async def test_subject_set_extracts_inline_anchors(hermes_home):
     expected = (
         "```md\n"
         "# FALKE B2B Shop development channel\n\n"
-        "Anchor:\n"
+        "Resources:\n"
         "  - path:~/devel/falke-b2b-shop/\n"
         "  - jira:https://evenonsunday.atlassian.net/jira/software/c/projects/FB2B\n"
         "```"
@@ -167,11 +167,84 @@ async def test_subject_get_defaults_to_resolved_bundle_and_scope_is_local(hermes
 
 
 @pytest.mark.asyncio
-async def test_subject_add_places_and_deduplicates_anchors(hermes_home):
+async def test_subject_add_places_and_deduplicates_resources(hermes_home):
     harness = SubjectHarness()
     await harness._handle_subject_command(_event("/subject set MODS-12345"))
 
     await harness._handle_subject_command(_event("/subject add path:~/devel/oui-b2c-shop"))
     result = await harness._handle_subject_command(_event("/subject add path:~/devel/oui-b2c-shop"))
 
-    assert result == "```md\n# MODS-12345\n\nAnchor:\n  - jira:MODS-12345\n  - path:~/devel/oui-b2c-shop\n```"
+    assert result == "```md\n# MODS-12345\n\nResources:\n  - jira:MODS-12345\n  - path:~/devel/oui-b2c-shop\n```"
+
+
+@pytest.mark.asyncio
+async def test_subject_set_preserves_existing_resources(hermes_home):
+    harness = SubjectHarness()
+    card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "1781871116.838719.md"
+    card.parent.mkdir(parents=True)
+    card.write_text(
+        "# Old subject\n\nSkills:\n  - eos-shop-platform\nTools:\n  - mcp:phpstorm\n\nResources:\n  - jira:MODS-12345\n",
+        encoding="utf-8",
+    )
+
+    result = await harness._handle_subject_command(_event("/subject set Better subject"))
+
+    assert result == (
+        "```md\n"
+        "# Better subject\n\n"
+        "Skills:\n"
+        "  - eos-shop-platform\n\n"
+        "Tools:\n"
+        "  - mcp:phpstorm\n\n"
+        "Resources:\n"
+        "  - jira:MODS-12345\n"
+        "```"
+    )
+
+
+@pytest.mark.asyncio
+async def test_subject_add_supports_aliases_and_keeps_resources_at_end(hermes_home):
+    harness = SubjectHarness()
+    card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "1781871116.838719.md"
+    card.parent.mkdir(parents=True)
+    card.write_text("# Existing\n\nResources:\n  - jira:MODS-1\n\nBody line after old resources\n", encoding="utf-8")
+
+    await harness._handle_subject_command(_event("/subject add gh:NousResearch/hermes-agent"))
+    await harness._handle_subject_command(_event("/subject add home:~/devel/hermes-agent"))
+    await harness._handle_subject_command(_event("/subject add obsidian:Hermes/Hermes Gateway Context Cards"))
+    result = await harness._handle_subject_command(_event("/subject add url:https://hermes-agent.nousresearch.com/docs"))
+
+    assert result == (
+        "```md\n"
+        "# Existing\n"
+        "Body line after old resources\n\n"
+        "Resources:\n"
+        "  - jira:MODS-1\n"
+        "  - github:NousResearch/hermes-agent\n"
+        "  - path:~/devel/hermes-agent\n"
+        "  - obsidian:Hermes/Hermes Gateway Context Cards\n"
+        "  - url:https://hermes-agent.nousresearch.com/docs\n"
+        "```"
+    )
+
+
+@pytest.mark.asyncio
+async def test_subject_get_migrates_legacy_anchor_label(hermes_home):
+    base = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM"
+    base.mkdir(parents=True)
+    (base / "1781871116.838719.md").write_text("# Legacy\n\nAnchor:\n  - jira:MODS-1\n", encoding="utf-8")
+
+    result = await SubjectHarness()._handle_subject_command(_event("/subject get --scope"))
+
+    assert result == "```md\n# Legacy\n\nResources:\n  - jira:MODS-1\n```"
+
+
+@pytest.mark.asyncio
+async def test_subject_update_uses_preprocessed_card_and_preserves_resources(hermes_home):
+    harness = SubjectHarness()
+    await harness._handle_subject_command(_event("/subject set MODS-12345"))
+    harness._subject_preprocess_override = lambda description, fallback: "# Updated subject\n"
+
+    result = await harness._handle_subject_command(_event("/subject update rename to updated subject"))
+
+    assert result == "```md\n# Updated subject\n\nResources:\n  - jira:MODS-12345\n```"
