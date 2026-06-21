@@ -1885,7 +1885,7 @@ class TestSendTyping:
             thread_ts="parent_ts",
             status="",
         )
-        assert "C123" not in adapter._active_status_threads
+        assert ("C123", "parent_ts") not in adapter._active_status_threads
 
     @pytest.mark.asyncio
     async def test_stop_typing_noop_without_tracked_thread(self, adapter):
@@ -1896,8 +1896,24 @@ class TestSendTyping:
         adapter._app.client.assistant_threads_setStatus.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_stop_typing_clears_only_matching_thread_when_metadata_present(self, adapter):
+        adapter._app.client.assistant_threads_setStatus = AsyncMock()
+        adapter._active_status_threads.add(("C123", "thread_a"))
+        adapter._active_status_threads.add(("C123", "thread_b"))
+
+        await adapter.stop_typing("C123", metadata={"thread_id": "thread_a"})
+
+        adapter._app.client.assistant_threads_setStatus.assert_called_once_with(
+            channel_id="C123",
+            thread_ts="thread_a",
+            status="",
+        )
+        assert ("C123", "thread_a") not in adapter._active_status_threads
+        assert ("C123", "thread_b") in adapter._active_status_threads
+
+    @pytest.mark.asyncio
     async def test_stop_typing_handles_api_error_gracefully(self, adapter):
-        adapter._active_status_threads["C123"] = "parent_ts"
+        adapter._active_status_threads.add(("C123", "parent_ts"))
         adapter._app.client.assistant_threads_setStatus = AsyncMock(
             side_effect=Exception("missing_scope")
         )
@@ -1909,7 +1925,7 @@ class TestSendTyping:
             thread_ts="parent_ts",
             status="",
         )
-        assert "C123" not in adapter._active_status_threads
+        assert ("C123", "parent_ts") not in adapter._active_status_threads
 
     @pytest.mark.asyncio
     async def test_send_clears_status_after_final_post(self, adapter):
@@ -1917,7 +1933,7 @@ class TestSendTyping:
             return_value={"ts": "reply_ts"}
         )
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
-        adapter._active_status_threads["C123"] = "parent_ts"
+        adapter._active_status_threads.add(("C123", "parent_ts"))
 
         result = await adapter.send("C123", "done", metadata={"thread_id": "parent_ts"})
 
@@ -1928,13 +1944,13 @@ class TestSendTyping:
             thread_ts="parent_ts",
             status="",
         )
-        assert "C123" not in adapter._active_status_threads
+        assert ("C123", "parent_ts") not in adapter._active_status_threads
 
     @pytest.mark.asyncio
     async def test_streaming_final_edit_clears_status(self, adapter):
         adapter._app.client.chat_update = AsyncMock()
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
-        adapter._active_status_threads["C123"] = "parent_ts"
+        adapter._active_status_threads.add(("C123", "parent_ts"))
 
         result = await adapter.edit_message(
             "C123",
@@ -1954,13 +1970,13 @@ class TestSendTyping:
             thread_ts="parent_ts",
             status="",
         )
-        assert "C123" not in adapter._active_status_threads
+        assert ("C123", "parent_ts") not in adapter._active_status_threads
 
     @pytest.mark.asyncio
     async def test_streaming_intermediate_edit_keeps_status(self, adapter):
         adapter._app.client.chat_update = AsyncMock()
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
-        adapter._active_status_threads["C123"] = "parent_ts"
+        adapter._active_status_threads.add(("C123", "parent_ts"))
 
         result = await adapter.edit_message(
             "C123",
@@ -1971,7 +1987,7 @@ class TestSendTyping:
 
         assert result.success
         adapter._app.client.assistant_threads_setStatus.assert_not_called()
-        assert adapter._active_status_threads["C123"] == "parent_ts"
+        assert ("C123", "parent_ts") in adapter._active_status_threads
 
 
 # ---------------------------------------------------------------------------
@@ -2429,7 +2445,14 @@ class TestReactions:
         # _handle_slack_message should register the message for reactions
         assert "1234567890.000001" in adapter._reacting_message_ids
 
-        # Simulate the base class calling on_processing_start
+        # _handle_slack_message should add the in-progress reaction immediately,
+        # before the base background-processing hook runs.
+        add_calls = adapter._app.client.reactions_add.call_args_list
+        assert len(add_calls) == 1
+        assert add_calls[0].kwargs["name"] == "lock"
+
+        # Simulate the base class calling on_processing_start; it should not
+        # duplicate the already-applied in-progress reaction.
         from gateway.platforms.base import MessageEvent, MessageType, SessionSource
         from gateway.config import Platform
 
@@ -2449,7 +2472,7 @@ class TestReactions:
 
         add_calls = adapter._app.client.reactions_add.call_args_list
         assert len(add_calls) == 1
-        assert add_calls[0].kwargs["name"] == "eyes"
+        assert add_calls[0].kwargs["name"] == "lock"
 
         # Simulate the base class calling on_processing_complete
         from gateway.platforms.base import ProcessingOutcome
@@ -2459,16 +2482,16 @@ class TestReactions:
         add_calls = adapter._app.client.reactions_add.call_args_list
         remove_calls = adapter._app.client.reactions_remove.call_args_list
         assert len(add_calls) == 2
-        assert add_calls[1].kwargs["name"] == "white_check_mark"
+        assert add_calls[1].kwargs["name"] == "heavy_check_mark"
         assert len(remove_calls) == 1
-        assert remove_calls[0].kwargs["name"] == "eyes"
+        assert remove_calls[0].kwargs["name"] == "lock"
 
         # Message ID should be cleaned up
         assert "1234567890.000001" not in adapter._reacting_message_ids
 
     @pytest.mark.asyncio
     async def test_reactions_failure_outcome(self, adapter):
-        """Failed processing should add :x: instead of :white_check_mark:."""
+        """Failed processing should add :x: instead of :heavy_check_mark:."""
         adapter._app.client.reactions_add = AsyncMock()
         adapter._app.client.reactions_remove = AsyncMock()
 
@@ -2500,7 +2523,7 @@ class TestReactions:
         assert len(add_calls) == 1
         assert add_calls[0].kwargs["name"] == "x"
         assert len(remove_calls) == 1
-        assert remove_calls[0].kwargs["name"] == "eyes"
+        assert remove_calls[0].kwargs["name"] == "lock"
 
     @pytest.mark.asyncio
     async def test_reactions_skipped_for_non_dm_non_mention(self, adapter):
@@ -2524,6 +2547,30 @@ class TestReactions:
         assert "1234567890.000003" not in adapter._reacting_message_ids
         adapter._app.client.reactions_add.assert_not_called()
         adapter._app.client.reactions_remove.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reactions_added_for_free_response_channel(self, adapter):
+        """Processed listen-all channel messages should get reaction lifecycle."""
+        adapter.config.extra["free_response_channels"] = "C123"
+        adapter._app.client.reactions_add = AsyncMock()
+        adapter._app.client.reactions_remove = AsyncMock()
+        adapter._app.client.users_info = AsyncMock(
+            return_value={"user": {"profile": {"display_name": "Tyler"}}}
+        )
+
+        event = {
+            "text": "hello",
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000005",
+        }
+        await adapter._handle_slack_message(event)
+
+        assert "1234567890.000005" in adapter._reacting_message_ids
+        adapter._app.client.reactions_add.assert_called_once_with(
+            channel="C123", timestamp="1234567890.000005", name="lock"
+        )
 
     @pytest.mark.asyncio
     async def test_reactions_disabled_via_env(self, adapter, monkeypatch):

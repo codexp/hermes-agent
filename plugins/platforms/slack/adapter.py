@@ -362,9 +362,14 @@ class SlackAdapter(BasePlatformAdapter):
         self._THREAD_CACHE_TTL = 60.0
         # Track message IDs that should get reaction lifecycle (DMs / @mentions).
         self._reacting_message_ids: set = set()
+        # Track messages where the in-progress :lock: reaction was already
+        # applied at receive time. The base lifecycle hook may run later (or
+        # much later when a message is queued behind an active session), so this
+        # prevents duplicate reactions while still letting completion replace it.
+        self._in_progress_reactions: set[Tuple[str, str]] = set()
         # Track active assistant thread status indicators so stop_typing can
-        # clear them (chat_id → thread_ts).
-        self._active_status_threads: Dict[str, str] = {}
+        # clear exactly the thread whose processing lifecycle completed.
+        self._active_status_threads: set[Tuple[str, str]] = set()
         # Slash-command contexts: stash response_url + user_id so send()
         # can route the first reply ephemerally.  Keyed by
         # (channel_id, user_id) to avoid cross-user collisions.
@@ -1180,7 +1185,7 @@ class SlackAdapter(BasePlatformAdapter):
 
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
-                await self.stop_typing(chat_id)
+                await self.stop_typing(chat_id, metadata=metadata)
 
             # Track the sent message ts so we can auto-respond to thread
             # replies without requiring @mention.
@@ -1248,6 +1253,7 @@ class SlackAdapter(BasePlatformAdapter):
         content: str,
         *,
         finalize: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Edit a previously sent Slack message."""
         if not self._app:
@@ -1260,7 +1266,7 @@ class SlackAdapter(BasePlatformAdapter):
                 text=formatted,
             )
             if finalize:
-                await self.stop_typing(chat_id)
+                await self.stop_typing(chat_id, metadata=metadata)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error(
@@ -1289,7 +1295,7 @@ class SlackAdapter(BasePlatformAdapter):
         if not thread_ts:
             return  # Can only set status in a thread context
 
-        self._active_status_threads[chat_id] = thread_ts
+        self._active_status_threads.add((chat_id, thread_ts))
         try:
             await self._get_client(chat_id).assistant_threads_setStatus(
                 channel_id=chat_id,
@@ -1305,17 +1311,25 @@ class SlackAdapter(BasePlatformAdapter):
         """Clear the assistant thread status indicator."""
         if not self._app:
             return
-        thread_ts = self._active_status_threads.pop(chat_id, None)
-        if not thread_ts:
+        thread_ts = None
+        if metadata:
+            thread_ts = metadata.get("thread_id") or metadata.get("thread_ts")
+        if thread_ts:
+            keys = [(chat_id, thread_ts)]
+        else:
+            keys = [key for key in self._active_status_threads if key[0] == chat_id]
+        if not keys:
             return
-        try:
-            await self._get_client(chat_id).assistant_threads_setStatus(
-                channel_id=chat_id,
-                thread_ts=thread_ts,
-                status="",
-            )
-        except Exception as e:
-            logger.debug("[Slack] assistant.threads.setStatus clear failed: %s", e)
+        for channel_id, active_thread_ts in keys:
+            self._active_status_threads.discard((channel_id, active_thread_ts))
+            try:
+                await self._get_client(channel_id).assistant_threads_setStatus(
+                    channel_id=channel_id,
+                    thread_ts=active_thread_ts,
+                    status="",
+                )
+            except Exception as e:
+                logger.debug("[Slack] assistant.threads.setStatus clear failed: %s", e)
 
     def _dm_top_level_threads_as_sessions(self) -> bool:
         """Whether top-level Slack DMs get per-message session threads.
@@ -1725,8 +1739,13 @@ class SlackAdapter(BasePlatformAdapter):
         if not ts or ts not in self._reacting_message_ids:
             return
         channel_id = getattr(event.source, "chat_id", None)
-        if channel_id:
-            await self._add_reaction(channel_id, ts, "eyes")
+        if not channel_id:
+            return
+        reaction_key = (channel_id, ts)
+        if reaction_key in self._in_progress_reactions:
+            return
+        if await self._add_reaction(channel_id, ts, "lock"):
+            self._in_progress_reactions.add(reaction_key)
 
     async def on_processing_complete(
         self, event: MessageEvent, outcome: ProcessingOutcome
@@ -1741,9 +1760,10 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id = getattr(event.source, "chat_id", None)
         if not channel_id:
             return
-        await self._remove_reaction(channel_id, ts, "eyes")
+        self._in_progress_reactions.discard((channel_id, ts))
+        await self._remove_reaction(channel_id, ts, "lock")
         if outcome == ProcessingOutcome.SUCCESS:
-            await self._add_reaction(channel_id, ts, "white_check_mark")
+            await self._add_reaction(channel_id, ts, "heavy_check_mark")
         elif outcome == ProcessingOutcome.FAILURE:
             await self._add_reaction(channel_id, ts, "x")
 
@@ -2538,6 +2558,16 @@ class SlackAdapter(BasePlatformAdapter):
                     for t in to_remove:
                         self._mentioned_threads.discard(t)
 
+        # Add :lock: immediately after all routing gates above have decided the
+        # message will be processed. This includes free-response channels and
+        # require_mention=false workspaces; ignored messages return before here,
+        # so we still avoid reacting to traffic Hermes will not answer.
+        _should_react = self._reactions_enabled()
+        if _should_react and ts:
+            self._reacting_message_ids.add(ts)
+            if channel_id and await self._add_reaction(channel_id, ts, "lock"):
+                self._in_progress_reactions.add((channel_id, ts))
+
         # When entering a thread for the first time (no existing session),
         # fetch thread context so the agent understands the conversation.
         if is_thread_reply and not self._has_active_session_for_thread(
@@ -2845,13 +2875,6 @@ class SlackAdapter(BasePlatformAdapter):
             reply_to_text=reply_to_text,
             auto_skill=_auto_skill,
         )
-
-        # Only react when bot is directly addressed (DM or @mention).
-        # In listen-all channels (require_mention=false), reacting to every
-        # casual message would be noisy.
-        _should_react = (is_dm or is_mentioned) and self._reactions_enabled()
-        if _should_react:
-            self._reacting_message_ids.add(ts)
 
         await self.handle_message(msg_event)
 
