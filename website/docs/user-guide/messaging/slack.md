@@ -332,8 +332,11 @@ platforms:
 
     extra:
       # Whether to reply in a thread (default: true).
-      # When false, channel messages get direct channel replies instead
-      # of threads. Messages inside existing threads still reply in-thread.
+      # true: top-level channel messages get threaded replies.
+      # false: top-level channel messages get direct channel replies.
+      # "marker": only thread top-level channel messages when the prompt
+      # starts with :thread:/🧵 or ends with (thread).
+      # Messages inside existing threads always reply in-thread.
       reply_in_thread: true
 
       # Also post thread replies to the main channel
@@ -345,8 +348,18 @@ platforms:
 | Key | Default | Description |
 |-----|---------|-------------|
 | `platforms.slack.reply_to_mode` | `"first"` | Threading mode for multi-part messages: `"off"`, `"first"`, or `"all"` |
-| `platforms.slack.extra.reply_in_thread` | `true` | When `false`, channel messages get direct replies instead of threads. Messages inside existing threads still reply in-thread. |
+| `platforms.slack.extra.reply_in_thread` | `true` | `true` threads top-level channel replies, `false` replies directly in the channel, and `"marker"` threads only when the prompt starts with `:thread:` / `🧵` or ends with `(thread)`. Messages inside existing threads always reply in-thread. |
 | `platforms.slack.extra.reply_broadcast` | `false` | When `true`, thread replies are also posted to the main channel. Only the first chunk is broadcast. |
+
+With `reply_in_thread: "marker"`, these top-level channel prompts all create a thread and Hermes strips the marker before processing the prompt:
+
+```text
+@Hermes :thread: Thread reply
+@Hermes :thread:Thread reply
+@Hermes 🧵 Thread reply
+@Hermes 🧵Thread reply
+@Hermes Thread reply (thread)
+```
 
 ### Session Isolation
 

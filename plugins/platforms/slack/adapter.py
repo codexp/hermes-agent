@@ -56,6 +56,35 @@ from gateway.platforms.base import (
 
 logger = logging.getLogger(__name__)
 
+_SLACK_THREAD_PREFIX_RE = re.compile(
+    r"^(?P<lead>\s*(?:<@[^>]+>\s*)?)(?P<marker>:thread:|🧵)\s*",
+    re.IGNORECASE,
+)
+_SLACK_THREAD_SUFFIX_RE = re.compile(r"\s+\(thread\)\s*$", re.IGNORECASE)
+
+
+def _strip_thread_reply_marker(text: str) -> Tuple[str, bool]:
+    """Strip an explicit Slack thread marker from a prompt.
+
+    Accepted markers are intentionally tolerant so both documented and natural
+    Slack forms work: ``:thread: prompt``, ``:thread:prompt``, ``🧵 prompt``,
+    ``🧵prompt``, and ``prompt (thread)``. A leading bot mention is preserved
+    so the existing mention-stripping logic can still run later.
+    """
+    if not text:
+        return text, False
+
+    stripped_prefix = _SLACK_THREAD_PREFIX_RE.sub(r"\g<lead>", text, count=1)
+    if stripped_prefix != text:
+        return stripped_prefix.strip(), True
+
+    stripped_suffix = _SLACK_THREAD_SUFFIX_RE.sub("", text, count=1)
+    if stripped_suffix != text:
+        return stripped_suffix.strip(), True
+
+    return text, False
+
+
 # ContextVar carrying the user_id of the slash-command invoker.
 # Set in _handle_slash_command, read in send() to match the correct
 # stashed response_url when multiple users issue commands on the same
@@ -2449,9 +2478,17 @@ class SlackAdapter(BasePlatformAdapter):
             channel_type = "im"
         is_dm = channel_type in {"im", "mpim"}  # Both 1:1 and group DMs
 
+        reply_in_thread_config = self.config.extra.get("reply_in_thread", True)
+        reply_in_thread_mode = str(reply_in_thread_config).strip().lower()
+        marker_mode = reply_in_thread_mode in {"marker", "marked", "on_marker"}
+        thread_marker_requested = False
+        if marker_mode and not is_dm:
+            text, thread_marker_requested = _strip_thread_reply_marker(text)
+
         # Build thread_ts for session keying.
         # In channels: fall back to ts so each top-level @mention starts a
-        #   new thread/session (the bot always replies in a thread).
+        #   new thread/session (the bot always replies in a thread), unless
+        #   marker mode is enabled and the message has no explicit marker.
         # In DMs: fall back to ts so each top-level DM reply thread gets
         #   its own session key (matching channel behavior). Set
         #   dm_top_level_threads_as_sessions: false in config to revert to
@@ -2463,7 +2500,7 @@ class SlackAdapter(BasePlatformAdapter):
         else:
             # Channel message session scoping.
             #
-            # Three cases:
+            # Four cases:
             #   (a) genuine thread reply   → scope session per thread
             #   (b) top-level, reply_in_thread=true (the default)  →
             #       legacy behaviour: each top-level message becomes its
@@ -2472,6 +2509,8 @@ class SlackAdapter(BasePlatformAdapter):
             #   (c) top-level, reply_in_thread=false → scope one session
             #       across the whole channel so context accumulates across
             #       messages (#15421 bug 1)
+            #   (d) top-level, reply_in_thread=marker → thread only when
+            #       the prompt starts with :thread:/🧵 or ends with (thread)
             event_thread_ts_raw = event.get("thread_ts")
             # Align with ``is_thread_reply`` below — a ``thread_ts ==
             # ts`` payload (some thread-root shapes) is not a real reply
@@ -2481,7 +2520,9 @@ class SlackAdapter(BasePlatformAdapter):
             # variants (Copilot on #15464).
             if event_thread_ts_raw and event_thread_ts_raw != ts:
                 thread_ts = event_thread_ts_raw
-            elif self.config.extra.get("reply_in_thread", True):
+            elif marker_mode:
+                thread_ts = ts if thread_marker_requested else None
+            elif reply_in_thread_config:
                 # Legacy default: treat ts as a synthetic thread root so
                 # this top-level message gets its own session.
                 thread_ts = ts
@@ -2557,6 +2598,13 @@ class SlackAdapter(BasePlatformAdapter):
                     ]
                     for t in to_remove:
                         self._mentioned_threads.discard(t)
+
+        if marker_mode and thread_marker_requested and not is_mentioned and not is_thread_reply:
+            logger.debug(
+                "[Slack] Treating top-level thread marker as title-only in %s",
+                channel_id,
+            )
+            return
 
         # Add :lock: immediately after all routing gates above have decided the
         # message will be processed. This includes free-response channels and
