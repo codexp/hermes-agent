@@ -379,6 +379,466 @@ def test_discard_lockfile_churn_restores_lock_when_package_json_clean(tmp_path):
     assert (tmp_path / "package-lock.json").read_text() == '{"lock":"old"}\n'
 
 
+def test_cmd_update_core_patches_defers_stash_restore_until_integration_branch(monkeypatch, tmp_path):
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    monkeypatch.setattr(hermes_main, "_run_pre_update_backup", lambda args: None)
+    monkeypatch.setattr(hermes_main, "_pause_windows_gateways_for_update", lambda: None)
+    monkeypatch.setattr(hermes_main, "_resume_windows_gateways_after_update", lambda resume: None)
+    monkeypatch.setattr(hermes_main, "_discard_lockfile_churn", lambda *args: None)
+    monkeypatch.setattr(hermes_main, "_get_origin_url", lambda *args: "git@github.com:NousResearch/hermes-agent.git")
+    monkeypatch.setattr(hermes_main, "_is_fork", lambda origin_url: False)
+    monkeypatch.setattr(hermes_main, "_capture_head_sha", lambda *args: "abc123")
+    monkeypatch.setattr(hermes_main, "_validate_critical_files_syntax", lambda root: (True, None, None))
+    monkeypatch.setattr(hermes_main, "_invalidate_update_cache", lambda: None)
+    monkeypatch.setattr(hermes_main, "_clear_bytecode_cache", lambda root: 0)
+    monkeypatch.setattr(hermes_main, "_write_update_incomplete_marker", lambda: None)
+    monkeypatch.setattr(hermes_main, "_clear_update_incomplete_marker", lambda: calls.append(["CLEAR_MARKER"]))
+    monkeypatch.setattr(hermes_main, "_install_python_dependencies_with_optional_fallback", lambda *args, **kwargs: None)
+    monkeypatch.setattr(hermes_main, "_refresh_active_lazy_features", lambda: None)
+    monkeypatch.setattr(hermes_main, "_update_node_dependencies", lambda: None)
+    monkeypatch.setattr(hermes_main, "_build_web_ui", lambda web_dir: None)
+    monkeypatch.setattr(hermes_config, "get_missing_env_vars", lambda required_only=True: [])
+    monkeypatch.setattr(hermes_config, "get_missing_config_fields", lambda: [])
+    monkeypatch.setattr(hermes_config, "check_config_version", lambda: (5, 5))
+    monkeypatch.setattr(hermes_config, "migrate_config", lambda **kw: {"env_added": [], "config_added": []})
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {
+            "updates": {
+                "core_patches": {
+                    "enabled": True,
+                    "integration_branch": "codexp/integration",
+                    "update_branch": "main",
+                    "integration_test_commands": [["python", "-c", "pass"]],
+                }
+            }
+        },
+    )
+
+    branch_state = {"branch": "codexp/integration"}
+    calls = []
+
+    def fake_stash(git_cmd, cwd):
+        calls.append(["STASH", branch_state["branch"]])
+        return "stash123"
+
+    def fake_restore(git_cmd, cwd, stash_ref, prompt_user=False, input_fn=None):
+        calls.append(["RESTORE", branch_state["branch"], stash_ref])
+        return True
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["git", "fetch", "origin", "main"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return SimpleNamespace(stdout=f"{branch_state['branch']}\n", stderr="", returncode=0)
+        if cmd == ["git", "checkout", "main"]:
+            branch_state["branch"] = "main"
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
+            return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
+        if cmd == ["git", "pull", "--ff-only", "origin", "main"]:
+            return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
+        if cmd == ["git", "checkout", "codexp/integration"]:
+            branch_state["branch"] = "codexp/integration"
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "merge", "--no-edit", "main"]:
+            return SimpleNamespace(stdout="merged\n", stderr="", returncode=0)
+        if cmd == ["python", "-c", "pass"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(hermes_main, "_stash_local_changes_if_needed", fake_stash)
+    monkeypatch.setattr(hermes_main, "_restore_stashed_changes", fake_restore)
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    assert ["STASH", "codexp/integration"] in calls
+    assert ["RESTORE", "codexp/integration", "stash123"] in calls
+    assert calls.index(["CLEAR_MARKER"]) < calls.index(["git", "checkout", "codexp/integration"])
+    assert calls.index(["RESTORE", "codexp/integration", "stash123"]) < calls.index(["git", "merge", "--no-edit", "main"])
+    assert calls.index(["git", "merge", "--no-edit", "main"]) < calls.index(["python", "-c", "pass"])
+
+
+def test_cmd_update_core_patches_discard_mode_does_not_restore_dropped_stash(monkeypatch, tmp_path):
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    monkeypatch.setattr(hermes_main, "_run_pre_update_backup", lambda args: None)
+    monkeypatch.setattr(hermes_main, "_pause_windows_gateways_for_update", lambda: None)
+    monkeypatch.setattr(hermes_main, "_resume_windows_gateways_after_update", lambda resume: None)
+    monkeypatch.setattr(hermes_main, "_discard_lockfile_churn", lambda *args: None)
+    monkeypatch.setattr(hermes_main, "_get_origin_url", lambda *args: "git@github.com:NousResearch/hermes-agent.git")
+    monkeypatch.setattr(hermes_main, "_is_fork", lambda origin_url: False)
+    monkeypatch.setattr(hermes_main, "_capture_head_sha", lambda *args: "abc123")
+    monkeypatch.setattr(hermes_main, "_validate_critical_files_syntax", lambda root: (True, None, None))
+    monkeypatch.setattr(hermes_main, "_invalidate_update_cache", lambda: None)
+    monkeypatch.setattr(hermes_main, "_clear_bytecode_cache", lambda root: 0)
+    monkeypatch.setattr(hermes_main, "_write_update_incomplete_marker", lambda: None)
+    monkeypatch.setattr(hermes_main, "_clear_update_incomplete_marker", lambda: None)
+    monkeypatch.setattr(hermes_main, "_install_python_dependencies_with_optional_fallback", lambda *args, **kwargs: None)
+    monkeypatch.setattr(hermes_main, "_refresh_active_lazy_features", lambda: None)
+    monkeypatch.setattr(hermes_main, "_update_node_dependencies", lambda: None)
+    monkeypatch.setattr(hermes_main, "_build_web_ui", lambda web_dir: None)
+    monkeypatch.setattr(hermes_config, "get_missing_env_vars", lambda required_only=True: [])
+    monkeypatch.setattr(hermes_config, "get_missing_config_fields", lambda: [])
+    monkeypatch.setattr(hermes_config, "check_config_version", lambda: (5, 5))
+    monkeypatch.setattr(hermes_config, "migrate_config", lambda **kw: {"env_added": [], "config_added": []})
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {
+            "updates": {
+                "non_interactive_local_changes": "discard",
+                "core_patches": {
+                    "enabled": True,
+                    "integration_branch": "codexp/integration",
+                    "update_branch": "main",
+                    "integration_test_commands": [],
+                },
+            }
+        },
+    )
+
+    branch_state = {"branch": "codexp/integration"}
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["git", "fetch", "origin", "main"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return SimpleNamespace(stdout=f"{branch_state['branch']}\n", stderr="", returncode=0)
+        if cmd == ["git", "checkout", "main"]:
+            branch_state["branch"] = "main"
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
+            return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
+        if cmd == ["git", "pull", "--ff-only", "origin", "main"]:
+            return SimpleNamespace(stdout="Updating\n", stderr="", returncode=0)
+        if cmd == ["git", "checkout", "codexp/integration"]:
+            branch_state["branch"] = "codexp/integration"
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "merge", "--no-edit", "main"]:
+            return SimpleNamespace(stdout="merged\n", stderr="", returncode=0)
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(hermes_main, "_stash_local_changes_if_needed", lambda git_cmd, cwd: "stash123")
+    monkeypatch.setattr(hermes_main, "_discard_stashed_changes", lambda git_cmd, cwd, stash_ref: calls.append(["DISCARD", stash_ref]) or True)
+    monkeypatch.setattr(hermes_main, "_restore_stashed_changes", lambda *args, **kwargs: calls.append(["RESTORE"] ) or True)
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    hermes_main.cmd_update(SimpleNamespace(yes=True))
+
+    assert ["DISCARD", "stash123"] in calls
+    assert ["RESTORE"] not in calls
+    assert ["git", "merge", "--no-edit", "main"] in calls
+
+
+def test_run_core_patches_test_command_rejects_shell_argv_lists(monkeypatch, tmp_path, capsys):
+    calls = []
+    monkeypatch.setattr(hermes_main.subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    ok = hermes_main._run_core_patches_test_command(["echo", "hello"], cwd=tmp_path, shell=True)
+
+    assert ok is False
+    assert calls == []
+    assert "must be configured as strings" in capsys.readouterr().out
+
+
+def test_cmd_update_core_patches_no_update_bails_if_restore_checkout_fails(monkeypatch, tmp_path):
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    monkeypatch.setattr(hermes_main, "_run_pre_update_backup", lambda args: None)
+    monkeypatch.setattr(hermes_main, "_pause_windows_gateways_for_update", lambda: None)
+    monkeypatch.setattr(hermes_main, "_resume_windows_gateways_after_update", lambda resume: None)
+    monkeypatch.setattr(hermes_main, "_get_origin_url", lambda *args: "git@github.com:NousResearch/hermes-agent.git")
+    monkeypatch.setattr(hermes_main, "_is_fork", lambda origin_url: False)
+    monkeypatch.setattr(hermes_main, "_invalidate_update_cache", lambda: None)
+    monkeypatch.setattr(hermes_config, "get_missing_env_vars", lambda required_only=True: [])
+    monkeypatch.setattr(hermes_config, "get_missing_config_fields", lambda: [])
+    monkeypatch.setattr(hermes_config, "check_config_version", lambda: (5, 5))
+    monkeypatch.setattr(hermes_config, "migrate_config", lambda **kw: {"env_added": [], "config_added": []})
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {
+            "updates": {
+                "core_patches": {
+                    "enabled": True,
+                    "integration_branch": "codexp/integration",
+                    "update_branch": "main",
+                }
+            }
+        },
+    )
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["git", "fetch", "origin", "main"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return SimpleNamespace(stdout="codexp/integration\n", stderr="", returncode=0)
+        if cmd == ["git", "checkout", "main"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
+            return SimpleNamespace(stdout="0\n", stderr="", returncode=0)
+        if cmd == ["git", "checkout", "codexp/integration"]:
+            return SimpleNamespace(stdout="", stderr="checkout failed\n", returncode=1)
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(hermes_main, "_stash_local_changes_if_needed", lambda git_cmd, cwd: "stash123")
+    monkeypatch.setattr(hermes_main, "_restore_stashed_changes", lambda *args, **kwargs: calls.append(["RESTORE"] ) or True)
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    with pytest.raises(SystemExit):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    assert ["RESTORE"] not in calls
+
+
+def test_core_patches_rebuild_requires_configured_feature_branches(monkeypatch, tmp_path, capsys):
+    calls = []
+    core_cfg = {
+        "integration_branch": "codexp/integration",
+        "feature_branches": [],
+        "integration_test_commands": [],
+    }
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", lambda cmd, **kwargs: calls.append(cmd))
+
+    ok = hermes_main._run_core_patches_rebuild(
+        ["git"],
+        tmp_path,
+        core_cfg,
+        updated_branch="main",
+        deferred_stash_ref=None,
+        prompt_for_restore=False,
+    )
+
+    assert ok is False
+    assert calls == []
+    out = capsys.readouterr().out
+    assert "No feature branches are configured" in out
+    assert "git reset --hard" not in out
+
+
+def test_core_patches_post_update_rebuilds_from_main_after_update_branch_reset(monkeypatch, tmp_path):
+    calls = []
+    core_cfg = {
+        "integration_branch": "codexp/integration",
+        "feature_branches": ["codexp/slack-reactions", "codexp/context-cards"],
+        "integration_test_commands": [["python", "-c", "pass"]],
+        "integration_test_shell": False,
+    }
+
+    def fake_restore(git_cmd, cwd, stash_ref, prompt_user=False, input_fn=None):
+        calls.append(["RESTORE", stash_ref])
+        return True
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["git", "checkout", "codexp/integration"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "reset", "--hard", "main"]:
+            return SimpleNamespace(stdout="HEAD is now at main\n", stderr="", returncode=0)
+        if cmd == ["git", "merge", "--no-edit", "codexp/slack-reactions"]:
+            return SimpleNamespace(stdout="merged feature 1\n", stderr="", returncode=0)
+        if cmd == ["git", "merge", "--no-edit", "codexp/context-cards"]:
+            return SimpleNamespace(stdout="merged feature 2\n", stderr="", returncode=0)
+        if cmd == ["python", "-c", "pass"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hermes_main, "_restore_stashed_changes", fake_restore)
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    ok = hermes_main._run_core_patches_post_update(
+        ["git"],
+        tmp_path,
+        core_cfg,
+        updated_branch="main",
+        deferred_stash_ref="stash123",
+        prompt_for_restore=False,
+        rebuild_from_scratch=True,
+    )
+
+    assert ok is True
+    assert calls == [
+        ["git", "checkout", "codexp/integration"],
+        ["git", "reset", "--hard", "main"],
+        ["git", "merge", "--no-edit", "codexp/slack-reactions"],
+        ["git", "merge", "--no-edit", "codexp/context-cards"],
+        ["RESTORE", "stash123"],
+        ["python", "-c", "pass"],
+    ]
+
+
+def test_cmd_update_core_patches_rebuilds_integration_after_ff_reset(monkeypatch, tmp_path):
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    monkeypatch.setattr(hermes_main, "_run_pre_update_backup", lambda args: None)
+    monkeypatch.setattr(hermes_main, "_pause_windows_gateways_for_update", lambda: None)
+    monkeypatch.setattr(hermes_main, "_resume_windows_gateways_after_update", lambda resume: None)
+    monkeypatch.setattr(hermes_main, "_discard_lockfile_churn", lambda *args: None)
+    monkeypatch.setattr(hermes_main, "_get_origin_url", lambda *args: "git@github.com:NousResearch/hermes-agent.git")
+    monkeypatch.setattr(hermes_main, "_is_fork", lambda origin_url: False)
+    monkeypatch.setattr(hermes_main, "_capture_head_sha", lambda *args: "abc123")
+    monkeypatch.setattr(hermes_main, "_validate_critical_files_syntax", lambda root: (True, None, None))
+    monkeypatch.setattr(hermes_main, "_invalidate_update_cache", lambda: None)
+    monkeypatch.setattr(hermes_main, "_clear_bytecode_cache", lambda root: 0)
+    monkeypatch.setattr(hermes_main, "_write_update_incomplete_marker", lambda: None)
+    monkeypatch.setattr(hermes_main, "_clear_update_incomplete_marker", lambda: None)
+    monkeypatch.setattr(hermes_main, "_install_python_dependencies_with_optional_fallback", lambda *args, **kwargs: None)
+    monkeypatch.setattr(hermes_main, "_refresh_active_lazy_features", lambda: None)
+    monkeypatch.setattr(hermes_main, "_update_node_dependencies", lambda: None)
+    monkeypatch.setattr(hermes_main, "_build_web_ui", lambda web_dir: None)
+    monkeypatch.setattr(hermes_config, "get_missing_env_vars", lambda required_only=True: [])
+    monkeypatch.setattr(hermes_config, "get_missing_config_fields", lambda: [])
+    monkeypatch.setattr(hermes_config, "check_config_version", lambda: (5, 5))
+    monkeypatch.setattr(hermes_config, "migrate_config", lambda **kw: {"env_added": [], "config_added": []})
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {
+            "updates": {
+                "core_patches": {
+                    "enabled": True,
+                    "integration_branch": "codexp/integration",
+                    "update_branch": "main",
+                    "feature_branches": ["codexp/slack-reactions"],
+                    "integration_test_commands": [["python", "-c", "pass"]],
+                }
+            }
+        },
+    )
+
+    branch_state = {"branch": "codexp/integration"}
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["git", "fetch", "origin", "main"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "rev-parse", "--abbrev-ref", "HEAD"]:
+            return SimpleNamespace(stdout=f"{branch_state['branch']}\n", stderr="", returncode=0)
+        if cmd == ["git", "checkout", "main"]:
+            branch_state["branch"] = "main"
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "rev-list", "HEAD..origin/main", "--count"]:
+            return SimpleNamespace(stdout="1\n", stderr="", returncode=0)
+        if cmd == ["git", "pull", "--ff-only", "origin", "main"]:
+            return SimpleNamespace(stdout="", stderr="fatal: Not possible to fast-forward\n", returncode=128)
+        if cmd == ["git", "reset", "--hard", "origin/main"]:
+            return SimpleNamespace(stdout="HEAD is now at origin\n", stderr="", returncode=0)
+        if cmd == ["git", "checkout", "codexp/integration"]:
+            branch_state["branch"] = "codexp/integration"
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "reset", "--hard", "main"]:
+            return SimpleNamespace(stdout="HEAD is now at main\n", stderr="", returncode=0)
+        if cmd == ["git", "merge", "--no-edit", "codexp/slack-reactions"]:
+            return SimpleNamespace(stdout="merged feature\n", stderr="", returncode=0)
+        if cmd == ["python", "-c", "pass"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(hermes_main, "_stash_local_changes_if_needed", lambda git_cmd, cwd: None)
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    assert ["git", "reset", "--hard", "origin/main"] in calls
+    assert ["git", "reset", "--hard", "main"] in calls
+    assert ["git", "merge", "--no-edit", "codexp/slack-reactions"] in calls
+    assert ["git", "merge", "--no-edit", "main"] not in calls
+
+
+def test_core_patches_post_update_restores_stash_on_integration_before_merge(monkeypatch, tmp_path):
+    calls = []
+
+    core_cfg = {
+        "integration_branch": "codexp/integration",
+        "integration_test_commands": [["python", "-m", "pytest", "tests/hermes_cli/test_cmd_update.py"]],
+        "integration_test_shell": False,
+    }
+
+    def fake_restore(git_cmd, cwd, stash_ref, prompt_user=False, input_fn=None):
+        calls.append(["RESTORE", stash_ref])
+        return True
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["git", "checkout", "codexp/integration"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "merge", "--no-edit", "main"]:
+            return SimpleNamespace(stdout="merged\n", stderr="", returncode=0)
+        if cmd == ["python", "-m", "pytest", "tests/hermes_cli/test_cmd_update.py"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hermes_main, "_restore_stashed_changes", fake_restore)
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    ok = hermes_main._run_core_patches_post_update(
+        ["git"],
+        tmp_path,
+        core_cfg,
+        updated_branch="main",
+        deferred_stash_ref="abc123",
+        prompt_for_restore=False,
+    )
+
+    assert ok is True
+    assert calls == [
+        ["git", "checkout", "codexp/integration"],
+        ["RESTORE", "abc123"],
+        ["git", "merge", "--no-edit", "main"],
+        ["python", "-m", "pytest", "tests/hermes_cli/test_cmd_update.py"],
+    ]
+
+
+def test_core_patches_post_update_stops_before_tests_on_merge_conflict(monkeypatch, tmp_path, capsys):
+    calls = []
+    core_cfg = {
+        "integration_branch": "codexp/integration",
+        "integration_test_commands": [["python", "-m", "pytest", "tests/hermes_cli/test_cmd_update.py"]],
+        "integration_test_shell": False,
+    }
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["git", "checkout", "codexp/integration"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "merge", "--no-edit", "main"]:
+            return SimpleNamespace(stdout="CONFLICT\n", stderr="", returncode=1)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    ok = hermes_main._run_core_patches_post_update(
+        ["git"],
+        tmp_path,
+        core_cfg,
+        updated_branch="main",
+        deferred_stash_ref=None,
+        prompt_for_restore=False,
+    )
+
+    assert ok is False
+    assert calls == [
+        ["git", "checkout", "codexp/integration"],
+        ["git", "merge", "--no-edit", "main"],
+    ]
+    assert "Core patch integration is blocked" in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------------------
 # Update uses .[all] with fallback to .
 # ---------------------------------------------------------------------------

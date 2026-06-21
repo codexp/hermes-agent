@@ -2636,6 +2636,28 @@ DEFAULT_CONFIG = {
         #               ignored paths — node_modules, venv, build outputs —
         #               are never touched.
         "non_interactive_local_changes": "stash",
+        # Optional local-core-patches workflow. When enabled, `hermes update`
+        # still updates the upstream lane (`main` by default), then restores
+        # the configured integration branch and merges the updated upstream
+        # branch into it. This is intentionally narrow and local, not a
+        # generic hook system. `integration_test_commands` are trusted
+        # developer-local commands. Prefer argv lists; string commands are
+        # split with shlex unless `integration_test_shell` is explicitly true.
+        "core_patches": {
+            "enabled": False,
+            "integration_branch": "codexp/integration",
+            "update_branch": "main",
+            "integration_test_commands": [],
+            "integration_test_shell": False,
+            # If `git pull --ff-only` on the update branch fails and Hermes has
+            # to reset main to origin/main, the integration history can no
+            # longer be trusted as a simple merge target. Rebuild integration
+            # from the updated main and then merge selected feature branches in
+            # order instead. If no feature branches are configured, Hermes
+            # stops before resetting integration because the patch stack cannot
+            # be reconstructed safely.
+            "feature_branches": [],
+        },
     },
 
     # Language Server Protocol — semantic diagnostics from real

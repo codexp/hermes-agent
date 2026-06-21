@@ -6323,6 +6323,245 @@ def _restore_stashed_changes(
     return True
 
 
+def _normalize_core_patches_config(config: dict) -> dict:
+    """Return normalized local core-patches update settings.
+
+    This is intentionally a small, opt-in workflow for local Hermes core patch
+    maintenance. It is not a generic update hook system.
+    """
+    updates = config.get("updates", {}) if isinstance(config, dict) else {}
+    raw = updates.get("core_patches", {}) if isinstance(updates, dict) else {}
+    if not isinstance(raw, dict):
+        raw = {}
+    commands = raw.get("integration_test_commands", [])
+    if not isinstance(commands, list):
+        commands = []
+    feature_branches = raw.get("feature_branches", [])
+    if not isinstance(feature_branches, list):
+        feature_branches = []
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "integration_branch": str(raw.get("integration_branch") or "codexp/integration"),
+        "update_branch": str(raw.get("update_branch") or "main"),
+        "integration_test_commands": commands,
+        "integration_test_shell": bool(raw.get("integration_test_shell", False)),
+        "feature_branches": [str(branch) for branch in feature_branches if branch],
+    }
+
+
+def _core_patches_update_context(config: dict, current_branch: str, update_branch: str) -> Optional[dict]:
+    """Return active core-patches context for this update, or ``None``.
+
+    Branch capture is best-effort: callers pass the existing current branch
+    value that ``hermes update`` already read. If it is unavailable or does not
+    match the configured integration branch, the workflow is simply disabled for
+    this run.
+    """
+    core_cfg = _normalize_core_patches_config(config)
+    if not core_cfg["enabled"]:
+        return None
+    if current_branch != core_cfg["integration_branch"]:
+        return None
+    if update_branch != core_cfg["update_branch"]:
+        return None
+    return core_cfg
+
+
+def _checkout_update_branch(git_cmd: list[str], cwd: Path, branch: str) -> bool:
+    result = subprocess.run(
+        git_cmd + ["checkout", branch],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return True
+    print(f"✗ Could not check out {branch}.")
+    if result.stderr.strip():
+        print(f"  {result.stderr.strip().splitlines()[0]}")
+    return False
+
+
+def _run_core_patches_test_command(command, *, cwd: Path, shell: bool) -> bool:
+    import shlex
+
+    if shell:
+        if isinstance(command, list):
+            print("✗ Core patches shell test commands must be configured as strings, not argv lists.")
+            return False
+        printable = str(command)
+        result = subprocess.run(printable, cwd=cwd, shell=True)
+    else:
+        if isinstance(command, list):
+            run_cmd = [str(part) for part in command]
+        else:
+            run_cmd = shlex.split(str(command))
+        printable = " ".join(shlex.quote(part) for part in run_cmd)
+        result = subprocess.run(run_cmd, cwd=cwd)
+    if result.returncode != 0:
+        print(f"✗ Core patches integration test failed: {printable}")
+        return False
+    return True
+
+
+def _run_core_patches_tests(cwd: Path, core_cfg: dict) -> bool:
+    commands = core_cfg.get("integration_test_commands", [])
+    if commands:
+        print("→ Running core patches integration tests...")
+    for command in commands:
+        if not _run_core_patches_test_command(
+            command,
+            cwd=cwd,
+            shell=bool(core_cfg.get("integration_test_shell", False)),
+        ):
+            print("  Core patches branch is checked out; fix the failure and rerun tests.")
+            return False
+    return True
+
+
+def _restore_core_patches_deferred_stash(
+    git_cmd: list[str],
+    cwd: Path,
+    stash_ref: Optional[str],
+    *,
+    prompt_for_restore: bool,
+    input_fn=None,
+) -> bool:
+    if stash_ref is None:
+        return True
+    restored = _restore_stashed_changes(
+        git_cmd,
+        cwd,
+        stash_ref,
+        prompt_user=prompt_for_restore,
+        input_fn=input_fn,
+    )
+    if not restored:
+        print("✗ Core patches update stopped because local changes were not restored cleanly.")
+        return False
+    return True
+
+
+def _run_core_patches_rebuild(
+    git_cmd: list[str],
+    cwd: Path,
+    core_cfg: dict,
+    *,
+    updated_branch: str,
+    deferred_stash_ref: Optional[str],
+    prompt_for_restore: bool,
+    input_fn=None,
+) -> bool:
+    """Rebuild integration from the updated branch after reset-based updates."""
+    integration_branch = core_cfg["integration_branch"]
+    feature_branches = core_cfg.get("feature_branches", [])
+    print(
+        f"→ Rebuilding {integration_branch} from {updated_branch} because the update branch was reset."
+    )
+    if not feature_branches:
+        print("✗ Core patch integration rebuild is blocked.")
+        print("  No feature branches are configured under updates.core_patches.feature_branches.")
+        print("  Configure the codexp/<feature> branches to replay, then rerun hermes update.")
+        return False
+
+    reset = subprocess.run(
+        git_cmd + ["reset", "--hard", updated_branch],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if reset.returncode != 0:
+        print(f"✗ Could not reset {integration_branch} to {updated_branch}.")
+        if reset.stderr.strip():
+            print(reset.stderr.strip())
+        return False
+
+    for feature_branch in feature_branches:
+        print(f"→ Merging core patch feature branch: {feature_branch}")
+        merge = subprocess.run(
+            git_cmd + ["merge", "--no-edit", feature_branch],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        if merge.returncode != 0:
+            print("✗ Core patch integration rebuild is blocked.")
+            print(f"  Conflict while merging {feature_branch} into {integration_branch}.")
+            if merge.stdout.strip():
+                print(merge.stdout.strip())
+            if merge.stderr.strip():
+                print(merge.stderr.strip())
+            print("  Resolve the merge on this branch, then run the configured integration tests.")
+            return False
+
+    if not _restore_core_patches_deferred_stash(
+        git_cmd,
+        cwd,
+        deferred_stash_ref,
+        prompt_for_restore=prompt_for_restore,
+        input_fn=input_fn,
+    ):
+        return False
+    return _run_core_patches_tests(cwd, core_cfg)
+
+
+def _run_core_patches_post_update(
+    git_cmd: list[str],
+    cwd: Path,
+    core_cfg: dict,
+    *,
+    updated_branch: str,
+    deferred_stash_ref: Optional[str],
+    prompt_for_restore: bool,
+    input_fn=None,
+    rebuild_from_scratch: bool = False,
+) -> bool:
+    """Restore the local integration lane after a successful upstream update."""
+    integration_branch = core_cfg["integration_branch"]
+    print(f"→ Restoring local core patches branch: {integration_branch}")
+    if not _checkout_update_branch(git_cmd, cwd, integration_branch):
+        return False
+
+    if rebuild_from_scratch:
+        return _run_core_patches_rebuild(
+            git_cmd,
+            cwd,
+            core_cfg,
+            updated_branch=updated_branch,
+            deferred_stash_ref=deferred_stash_ref,
+            prompt_for_restore=prompt_for_restore,
+            input_fn=input_fn,
+        )
+
+    if not _restore_core_patches_deferred_stash(
+        git_cmd,
+        cwd,
+        deferred_stash_ref,
+        prompt_for_restore=prompt_for_restore,
+        input_fn=input_fn,
+    ):
+        return False
+
+    print(f"→ Merging updated {updated_branch} into {integration_branch}...")
+    merge = subprocess.run(
+        git_cmd + ["merge", "--no-edit", updated_branch],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if merge.returncode != 0:
+        print("✗ Core patch integration is blocked after Hermes update.")
+        print(f"  Conflict while merging {updated_branch} into {integration_branch}.")
+        if merge.stdout.strip():
+            print(merge.stdout.strip())
+        if merge.stderr.strip():
+            print(merge.stderr.strip())
+        print("  Resolve the merge on this branch, then run the configured integration tests.")
+        return False
+
+    return _run_core_patches_tests(cwd, core_cfg)
+
+
 def _discard_stashed_changes(
     git_cmd: list[str],
     cwd: Path,
@@ -8574,19 +8813,22 @@ def _cmd_update_impl(args, gateway_mode: bool):
         or assume_yes
         or not (sys.stdin.isatty() and sys.stdout.isatty())
     )
+    update_config = {}
+    try:
+        from hermes_cli.config import load_config
+
+        update_config = load_config() or {}
+    except Exception as exc:
+        # Never let a config read failure change the safe defaults.
+        logger.debug("Could not read update config: %s", exc)
+        update_config = {}
+
     discard_local_changes = False
     if _non_interactive_update:
-        try:
-            from hermes_cli.config import load_config
-
-            _update_cfg = (load_config() or {}).get("updates", {})
-            if isinstance(_update_cfg, dict):
-                _mode = str(_update_cfg.get("non_interactive_local_changes", "stash")).lower()
-                discard_local_changes = _mode == "discard"
-        except Exception as exc:
-            # Never let a config read failure change the safe default.
-            logger.debug("Could not read updates.non_interactive_local_changes: %s", exc)
-            discard_local_changes = False
+        _update_cfg = update_config.get("updates", {}) if isinstance(update_config, dict) else {}
+        if isinstance(_update_cfg, dict):
+            _mode = str(_update_cfg.get("non_interactive_local_changes", "stash")).lower()
+            discard_local_changes = _mode == "discard"
 
     print("⚕ Updating Hermes Agent...")
     print()
@@ -8727,6 +8969,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
             check=True,
         )
         current_branch = result.stdout.strip()
+        core_patches_ctx = _core_patches_update_context(
+            update_config,
+            current_branch,
+            branch,
+        )
 
         # If user is on a different branch than the update target, switch
         # to the target. When the target is "main" this is the historical
@@ -8800,23 +9047,40 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if is_fork and branch == "main":
                 _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
 
-            # Restore stash and switch back to original branch if we moved
-            if auto_stash_ref is not None:
-                _restore_stashed_changes(
-                    git_cmd,
-                    PROJECT_ROOT,
-                    auto_stash_ref,
-                    prompt_user=prompt_for_restore,
-                    input_fn=gw_input_fn,
-                )
-            if current_branch not in {branch, "HEAD"}:
-                subprocess.run(
-                    git_cmd + ["checkout", current_branch],
-                    cwd=PROJECT_ROOT,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
+            # Restore stash and switch back to original branch if we moved.
+            # For the opt-in core-patches workflow, local changes captured from
+            # codexp/integration must be restored after that branch is checked
+            # out again, not onto main.
+            if core_patches_ctx is not None and current_branch not in {branch, "HEAD"}:
+                if not _checkout_update_branch(git_cmd, PROJECT_ROOT, current_branch):
+                    sys.exit(1)
+                if auto_stash_ref is not None:
+                    restored = _restore_stashed_changes(
+                        git_cmd,
+                        PROJECT_ROOT,
+                        auto_stash_ref,
+                        prompt_user=prompt_for_restore,
+                        input_fn=gw_input_fn,
+                    )
+                    if not restored:
+                        sys.exit(1)
+            else:
+                if auto_stash_ref is not None:
+                    _restore_stashed_changes(
+                        git_cmd,
+                        PROJECT_ROOT,
+                        auto_stash_ref,
+                        prompt_user=prompt_for_restore,
+                        input_fn=gw_input_fn,
+                    )
+                if current_branch not in {branch, "HEAD"}:
+                    subprocess.run(
+                        git_cmd + ["checkout", current_branch],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
             print("✓ Already up to date!")
             _resume_windows_gateways_after_update(_windows_gateway_resume)
             return
@@ -8842,6 +9106,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         print("→ Pulling updates...")
         update_succeeded = False
+        update_branch_was_reset = False
         # Capture the pre-pull SHA so we can auto-roll-back if the new code
         # has a syntax error in a critical-path file (PR #28452 incident:
         # orphan merge-conflict markers in hermes_cli/config.py bricked
@@ -8876,6 +9141,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
                     )
                     sys.exit(1)
+                update_branch_was_reset = True
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit
@@ -8932,10 +9198,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     # Non-interactive update + user opted into discarding local
                     # source edits (updates.non_interactive_local_changes:
                     # discard). Throw the stash away instead of re-applying it.
+                    # Core-patches post-update must not try to restore this ref.
                     _discard_stashed_changes(
                         git_cmd,
                         PROJECT_ROOT,
                         auto_stash_ref,
+                    )
+                    auto_stash_ref = None
+                elif core_patches_ctx is not None:
+                    print(
+                        f"  ℹ️  Local changes preserved until {core_patches_ctx['integration_branch']} is restored."
                     )
                 else:
                     _restore_stashed_changes(
@@ -9029,6 +9301,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # breadcrumb now — the remaining steps (lazy refresh, node deps, web
         # UI, desktop rebuild) are non-core and can't brick the venv.
         _clear_update_incomplete_marker()
+
+        if core_patches_ctx is not None:
+            core_patches_ok = _run_core_patches_post_update(
+                git_cmd,
+                PROJECT_ROOT,
+                core_patches_ctx,
+                updated_branch=branch,
+                deferred_stash_ref=auto_stash_ref,
+                prompt_for_restore=prompt_for_restore,
+                input_fn=gw_input_fn,
+                rebuild_from_scratch=update_branch_was_reset,
+            )
+            if not core_patches_ok:
+                sys.exit(1)
 
         _refresh_active_lazy_features()
 
