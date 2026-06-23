@@ -37,6 +37,7 @@ def adapter():
     a._app.client = AsyncMock()
     a._bot_user_id = "U_BOT"
     a._running = True
+    a._fetch_thread_parent_text = AsyncMock(return_value="")
     a.handle_message = AsyncMock()
     return a
 
@@ -295,7 +296,7 @@ class TestChannelSessionScopeMarkerMode:
         assert captured[0].text == expected_text
 
     @pytest.mark.asyncio
-    async def test_bare_thread_marker_in_free_response_channel_is_title_only(
+    async def test_bare_thread_marker_in_free_response_channel_starts_thread(
         self, adapter
     ):
         adapter.config.extra["reply_in_thread"] = "marker"
@@ -305,6 +306,8 @@ class TestChannelSessionScopeMarkerMode:
             ts="1700000000.000022",
         )
 
+        captured = []
+        adapter.handle_message = AsyncMock(side_effect=lambda e: captured.append(e))
         with patch.object(
             adapter,
             "_resolve_user_name",
@@ -312,7 +315,63 @@ class TestChannelSessionScopeMarkerMode:
         ):
             await adapter._handle_slack_message(event)
 
-        adapter.handle_message.assert_not_awaited()
+        assert len(captured) == 1
+        assert captured[0].source.thread_id == "1700000000.000022"
+        assert captured[0].reply_to_message_id is None
+        assert captured[0].text == "Hermes Core patches"
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_without_marker_stays_in_slack_thread(self, adapter):
+        adapter.config.extra["reply_in_thread"] = "marker"
+        adapter.config.extra["free_response_channels"] = ["C_CHAN"]
+        event = _channel_event(
+            "direct question from Slack thread UI",
+            ts="1700000000.000023",
+            thread_ts="1700000000.000999",
+        )
+
+        captured = []
+        adapter.handle_message = AsyncMock(side_effect=lambda e: captured.append(e))
+        with patch.object(
+            adapter,
+            "_resolve_user_name",
+            new=AsyncMock(return_value="testuser"),
+        ), patch.object(adapter, "_fetch_thread_context", new=AsyncMock(return_value="")) as fetch_ctx:
+            await adapter._handle_slack_message(event)
+
+        assert len(captured) == 1
+        assert captured[0].source.thread_id == "1700000000.000999"
+        assert captured[0].reply_to_message_id == "1700000000.000999"
+        fetch_ctx.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_reply_to_marker_created_thread_stays_in_that_thread(self, adapter):
+        adapter.config.extra["reply_in_thread"] = "marker"
+        adapter.config.extra["free_response_channels"] = ["C_CHAN"]
+        root_event = _channel_event(
+            ":thread: <@U_BOT> Thread reply",
+            ts="1700000000.000024",
+        )
+        reply_event = _channel_event(
+            "continuing the marked thread",
+            ts="1700000000.000025",
+            thread_ts="1700000000.000024",
+        )
+
+        captured = []
+        adapter.handle_message = AsyncMock(side_effect=lambda e: captured.append(e))
+        with patch.object(
+            adapter,
+            "_resolve_user_name",
+            new=AsyncMock(return_value="testuser"),
+        ), patch.object(adapter, "_fetch_thread_context", new=AsyncMock(return_value="")):
+            await adapter._handle_slack_message(root_event)
+            await adapter._handle_slack_message(reply_event)
+
+        assert len(captured) == 2
+        assert captured[0].source.thread_id == "1700000000.000024"
+        assert captured[1].source.thread_id == "1700000000.000024"
+        assert captured[1].reply_to_message_id == "1700000000.000024"
 
 
 class TestThreadReplyAlwaysScopesByThread:

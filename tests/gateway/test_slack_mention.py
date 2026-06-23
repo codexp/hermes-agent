@@ -495,6 +495,41 @@ def test_config_bridges_slack_reply_in_thread(monkeypatch, tmp_path):
     ) == "171.000"
 
 
+def test_slack_marker_mode_thread_resolution_requires_marked_root():
+    config = PlatformConfig(
+        enabled=True,
+        token="xoxb-test",
+        extra={"reply_in_thread": "marker"},
+    )
+    adapter = SlackAdapter(config)
+
+    # Direct top-level prompts can arrive at send-time with both reply_to and
+    # synthetic metadata.thread_id set to the triggering message id (progress
+    # and stream-consumer fallback paths do this). In marker mode, that must
+    # stay flat in the channel.
+    assert adapter._resolve_thread_ts(
+        reply_to="171.000",
+        metadata={"thread_id": "171.000"},
+    ) is None
+
+    # The same equal root is legitimate when it was explicitly created by a
+    # top-level :thread:/🧵 marker. This is the case that keeps the initial
+    # marker-created response in its Slack thread instead of flattening the
+    # final answer back into the channel.
+    adapter._marked_thread_roots.add("171.000")
+    assert adapter._resolve_thread_ts(
+        reply_to="171.000",
+        metadata={"thread_id": "171.000"},
+    ) == "171.000"
+
+    # Real thread replies (reply_to differs from thread parent) still resolve to
+    # the parent thread in marker mode.
+    assert adapter._resolve_thread_ts(
+        reply_to="171.500",
+        metadata={"thread_id": "171.000"},
+    ) == "171.000"
+
+
 def test_config_bridges_slack_strict_mention(monkeypatch, tmp_path):
     from gateway.config import load_gateway_config
 
