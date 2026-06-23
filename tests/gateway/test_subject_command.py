@@ -75,7 +75,7 @@ async def test_subject_set_extracts_inline_resources(hermes_home):
         "```md\n"
         "# FALKE B2B Shop development channel\n\n"
         "Resources:\n"
-        "  - path:~/devel/falke-b2b-shop/\n"
+        "  - home:~/devel/falke-b2b-shop/\n"
         "  - jira:https://evenonsunday.atlassian.net/jira/software/c/projects/FB2B\n"
         "```"
     )
@@ -203,7 +203,7 @@ async def test_subject_set_preserves_existing_resources(hermes_home):
 
 
 @pytest.mark.asyncio
-async def test_subject_add_supports_aliases_and_keeps_resources_at_end(hermes_home):
+async def test_subject_add_preserves_provided_resource_text_and_keeps_resources_at_end(hermes_home):
     harness = SubjectHarness()
     card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "1781871116.838719.md"
     card.parent.mkdir(parents=True)
@@ -220,8 +220,8 @@ async def test_subject_add_supports_aliases_and_keeps_resources_at_end(hermes_ho
         "Body line after old resources\n\n"
         "Resources:\n"
         "  - jira:MODS-1\n"
-        "  - github:NousResearch/hermes-agent\n"
-        "  - path:~/devel/hermes-agent\n"
+        "  - gh:NousResearch/hermes-agent\n"
+        "  - home:~/devel/hermes-agent\n"
         "  - obsidian:Hermes/Hermes Gateway Context Cards\n"
         "  - url:https://hermes-agent.nousresearch.com/docs\n"
         "```"
@@ -240,11 +240,32 @@ async def test_subject_get_migrates_legacy_anchor_label(hermes_home):
 
 
 @pytest.mark.asyncio
-async def test_subject_update_uses_preprocessed_card_and_preserves_resources(hermes_home):
+async def test_subject_update_uses_preprocessed_card_without_restoring_resources(hermes_home):
     harness = SubjectHarness()
     await harness._handle_subject_command(_event("/subject set MODS-12345"))
     harness._subject_preprocess_override = lambda description, fallback: "# Updated subject\n"
 
     result = await harness._handle_subject_command(_event("/subject update rename to updated subject"))
 
-    assert result == "```md\n# Updated subject\n\nResources:\n  - jira:MODS-12345\n```"
+    assert result == "```md\n# Updated subject\n```"
+
+
+@pytest.mark.asyncio
+async def test_subject_update_can_remove_and_deduplicate_resources(hermes_home):
+    harness = SubjectHarness()
+    card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "1781871116.838719.md"
+    card.parent.mkdir(parents=True)
+    card.write_text(
+        "# Existing\n\nResources:\n  - path:/home/ewe/devel/shop\n  - jira:https://jira.example/browse/SB2C\n  - path:/home/ewe/devel/shop\n",
+        encoding="utf-8",
+    )
+    harness._subject_preprocess_override = lambda description, fallback: (
+        "# Existing\n\nResources:\n  - path:/home/ewe/devel/shop\n"
+    )
+
+    result = await harness._handle_subject_command(
+        _event("/subject update remove the jira resource and deduplicate resources")
+    )
+
+    assert result == "```md\n# Existing\n\nResources:\n  - path:/home/ewe/devel/shop\n```"
+    assert card.read_text() == "# Existing\n\nResources:\n  - path:/home/ewe/devel/shop\n"
