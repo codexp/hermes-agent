@@ -317,7 +317,8 @@ class GatewaySlashCommandsMixin:
                 "- First line must be a level-1 Markdown heading.\n"
                 "- Put typed resources under a `Resources:` block at the end of the file.\n"
                 "- Supported resources: jira:, github:, gh:, path:, home:, url:, urn:, obsidian:.\n"
-                "- Normalize home: resources to path: and gh: resources to github:.\n"
+                "- Treat Resources entries as opaque user-provided identifiers: do not resolve, normalize, retag, expand, or reformat them.\n"
+                "- For update instructions, the updated Resources block is authoritative; do not re-add old resources the user removed.\n"
                 "- If the input is only `jira:KEY`, use `# KEY` and `Resources: - jira:KEY`.\n"
                 "- Do not include internal file paths unless the user provided them as resources.\n\n"
                 f"Raw /subject set input:\n{description}\n\n"
@@ -416,22 +417,11 @@ class GatewaySlashCommandsMixin:
 
         resource_re = re.compile(r"^(jira|github|gh|path|home|url|urn|obsidian):(.+)$", re.IGNORECASE)
 
-        def _normalize_resource(kind: str, value: str) -> str:
-            kind = kind.lower()
-            if kind == "home":
-                kind = "path"
-            elif kind == "gh":
-                kind = "github"
-            return f"{kind}:{value.strip()}"
-
         def _resource_from_line(line: str) -> str | None:
-            line = _normalize_description(line)
+            line = line.strip()
             if re.fullmatch(r"[A-Z][A-Z0-9]+-\d+", line):
                 return f"jira:{line}"
-            match = resource_re.match(line)
-            if match:
-                return _normalize_resource(match.group(1), match.group(2))
-            return None
+            return line if resource_re.match(line) else None
 
         def _migrate_resources_label(content: str) -> str:
             return re.sub(r"(?m)^(\s*)Anchor:\s*$", r"\1Resources:", content or "")
@@ -513,7 +503,7 @@ class GatewaySlashCommandsMixin:
                 before = desc[last:match.start()].strip()
                 if before:
                     title_parts.append(before)
-                resource = _normalize_resource(match.group(1), match.group(2))
+                resource = match.group(0)
                 if resource not in resources:
                     resources.append(resource)
                 last = match.end()
@@ -530,11 +520,20 @@ class GatewaySlashCommandsMixin:
                 title = desc
             return _render_card([f"# {title}"] if title else [], resources)
 
-        def _merge_card_update(existing: str, updated: str) -> str:
+        def _merge_card_update(
+            existing: str,
+            updated: str,
+            *,
+            preserve_existing_resources: bool = True,
+        ) -> str:
             existing_body, existing_resources = _split_resources(existing)
             updated_body, updated_resources = _split_resources(updated)
             body = _preserve_metadata_blocks(updated_body or existing_body, existing_body)
-            resources = _merge_resources(updated_resources, existing_resources)
+            resources = (
+                _merge_resources(updated_resources, existing_resources)
+                if preserve_existing_resources
+                else updated_resources
+            )
             return _render_card(body, resources)
 
         def _add_to_card(existing: str, line: str) -> str:
@@ -595,7 +594,7 @@ class GatewaySlashCommandsMixin:
                 f"Existing card:\n{fallback_content}\n\nUpdate instruction:\n{instruction}",
                 fallback_content,
             )
-            content = _merge_card_update(get_proc.stdout, preprocessed)
+            content = _merge_card_update(get_proc.stdout, preprocessed, preserve_existing_resources=False)
             set_proc = await asyncio.to_thread(_run_context, ["set", *scope_args, "--", content])
             if set_proc.returncode != 0:
                 return f"/subject update failed: `{(set_proc.stderr or set_proc.stdout).strip()}`"
