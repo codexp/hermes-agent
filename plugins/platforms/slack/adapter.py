@@ -380,6 +380,13 @@ class SlackAdapter(BasePlatformAdapter):
         # respond to ALL subsequent messages in that thread automatically.
         self._mentioned_threads: set = set()
         self._MENTIONED_THREADS_MAX = 5000
+        # In reply_in_thread=marker mode, these roots distinguish explicit
+        # top-level :thread:/🧵 prompts from the synthetic top-level progress
+        # anchors that use the same Slack timestamp for metadata.thread_id and
+        # reply_to. Real Slack thread replies are still threaded even when they
+        # were not marker-created.
+        self._marked_thread_roots: set = set()
+        self._MARKED_THREAD_ROOTS_MAX = 5000
         # Assistant thread metadata keyed by (channel_id, thread_ts). Slack's
         # AI Assistant lifecycle events can arrive before/alongside message
         # events, and they carry the user/thread identity needed for stable
@@ -1384,12 +1391,33 @@ class SlackAdapter(BasePlatformAdapter):
         # top-level message. reply_to is the incoming message's own id, so
         # when thread_id == reply_to the "thread" is synthetic and we reply
         # directly in the channel instead.
-        if not self.config.extra.get("reply_in_thread", True):
-            md = metadata or {}
+        reply_in_thread_config = self.config.extra.get("reply_in_thread", True)
+        reply_in_thread_mode = str(reply_in_thread_config).strip().lower()
+        marker_mode = reply_in_thread_mode in {"marker", "marked", "on_marker"}
+
+        md = metadata or {}
+
+        if not reply_in_thread_config:
             existing_thread = md.get("thread_id") or md.get("thread_ts")
             if existing_thread and reply_to and existing_thread == reply_to:
                 existing_thread = None
             return existing_thread or None
+
+        if marker_mode:
+            candidate = md.get("thread_id") or md.get("thread_ts")
+            if candidate and str(candidate) in self._marked_thread_roots:
+                return candidate
+            # Top-level direct prompts can arrive at send time with
+            # metadata.thread_id == reply_to because progress/streaming paths
+            # use the triggering message id as a reply anchor. That synthetic
+            # root must stay flat in the channel. A real Slack thread reply has
+            # metadata.thread_id = parent ts and reply_to = child ts, so the
+            # values differ and should remain threaded.
+            if candidate and reply_to and str(candidate) == str(reply_to):
+                return None
+            if candidate:
+                return candidate
+            return None
 
         if metadata:
             if metadata.get("thread_id"):
@@ -2481,15 +2509,19 @@ class SlackAdapter(BasePlatformAdapter):
             # Channel message session scoping.
             #
             # Four cases:
-            #   (a) genuine thread reply   → scope session per thread
-            #   (b) top-level, reply_in_thread=true (the default)  →
+            #   (a) genuine thread reply → scope session per thread, including
+            #       marker mode. A user who types inside a Slack thread expects
+            #       the response in that same Slack thread.
+            #   (b) top-level marker prompt in marker mode → use this message
+            #       as an explicit thread root.
+            #   (c) top-level, reply_in_thread=true (the default)  →
             #       legacy behaviour: each top-level message becomes its
             #       own thread, so the UX still "replies in a thread"
             #       and sessions are keyed per thread root
-            #   (c) top-level, reply_in_thread=false → scope one session
+            #   (d) top-level, reply_in_thread=false → scope one session
             #       across the whole channel so context accumulates across
             #       messages (#15421 bug 1)
-            #   (d) top-level, reply_in_thread=marker → thread only when
+            #   (e) top-level, reply_in_thread=marker → thread only when
             #       the prompt starts with :thread:/🧵 or ends with (thread)
             event_thread_ts_raw = event.get("thread_ts")
             # Align with ``is_thread_reply`` below — a ``thread_ts ==
@@ -2500,8 +2532,26 @@ class SlackAdapter(BasePlatformAdapter):
             # variants (Copilot on #15464).
             if event_thread_ts_raw and event_thread_ts_raw != ts:
                 thread_ts = event_thread_ts_raw
+                if marker_mode and thread_marker_requested:
+                    self._marked_thread_roots.add(event_thread_ts_raw)
+                    if len(self._marked_thread_roots) > self._MARKED_THREAD_ROOTS_MAX:
+                        excess = (
+                            len(self._marked_thread_roots)
+                            - self._MARKED_THREAD_ROOTS_MAX // 2
+                        )
+                        for old_ts in list(self._marked_thread_roots)[:excess]:
+                            self._marked_thread_roots.discard(old_ts)
             elif marker_mode:
                 thread_ts = ts if thread_marker_requested else None
+                if thread_marker_requested and ts:
+                    self._marked_thread_roots.add(ts)
+                    if len(self._marked_thread_roots) > self._MARKED_THREAD_ROOTS_MAX:
+                        excess = (
+                            len(self._marked_thread_roots)
+                            - self._MARKED_THREAD_ROOTS_MAX // 2
+                        )
+                        for old_ts in list(self._marked_thread_roots)[:excess]:
+                            self._marked_thread_roots.discard(old_ts)
             elif reply_in_thread_config:
                 # Legacy default: treat ts as a synthetic thread root so
                 # this top-level message gets its own session.
@@ -2579,16 +2629,9 @@ class SlackAdapter(BasePlatformAdapter):
                     for t in to_remove:
                         self._mentioned_threads.discard(t)
 
-        if marker_mode and thread_marker_requested and not is_mentioned and not is_thread_reply:
-            logger.debug(
-                "[Slack] Treating top-level thread marker as title-only in %s",
-                channel_id,
-            )
-            return
-
         # When entering a thread for the first time (no existing session),
         # fetch thread context so the agent understands the conversation.
-        if is_thread_reply and not self._has_active_session_for_thread(
+        if is_thread_reply and thread_ts and not self._has_active_session_for_thread(
             channel_id=channel_id,
             thread_ts=event_thread_ts,
             user_id=user_id,
