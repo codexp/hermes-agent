@@ -238,6 +238,54 @@ async def test_subject_add_skill_colon_migrates_legacy_inline_skill(hermes_home)
 
 
 @pytest.mark.asyncio
+async def test_subject_unknown_subcommand_usage_mentions_remove_and_unset(hermes_home):
+    result = await SubjectHarness()._handle_subject_command(_event("/subject nope"))
+
+    assert result == (
+        "Usage: /subject [get [--scope] | set <description> | update <instruction> | "
+        "add {type}:{value} | remove {type}:{value} | unset {type}:{value}]"
+    )
+
+
+@pytest.mark.asyncio
+async def test_subject_remove_skill_drops_empty_skills_block(hermes_home):
+    harness = SubjectHarness()
+    card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "1781871116.838719.md"
+    card.parent.mkdir(parents=True)
+    card.write_text(
+        "# Hermes Setup\n\nSkills:\n  - hermes-agent\n\nResources:\n  - path:/home/ewe/.hermes/hermes-agent\n",
+        encoding="utf-8",
+    )
+
+    result = await harness._handle_subject_command(_event("/subject remove skill:hermes-agent"))
+
+    assert result == (
+        "```md\n"
+        "# Hermes Setup\n\n"
+        "Resources:\n"
+        "  - path:/home/ewe/.hermes/hermes-agent\n"
+        "```"
+    )
+    assert card.read_text() == "# Hermes Setup\n\nResources:\n  - path:/home/ewe/.hermes/hermes-agent\n"
+
+
+@pytest.mark.asyncio
+async def test_subject_unset_resource_drops_empty_resources_block(hermes_home):
+    harness = SubjectHarness()
+    card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "1781871116.838719.md"
+    card.parent.mkdir(parents=True)
+    card.write_text(
+        "# Hermes Setup\n\nResources:\n  - path:/home/ewe/.hermes/hermes-agent\n",
+        encoding="utf-8",
+    )
+
+    result = await harness._handle_subject_command(_event("/subject unset path:/home/ewe/.hermes/hermes-agent"))
+
+    assert result == "```md\n# Hermes Setup\n```"
+    assert card.read_text() == "# Hermes Setup\n"
+
+
+@pytest.mark.asyncio
 async def test_subject_set_preserves_existing_resources(hermes_home):
     harness = SubjectHarness()
     card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "1781871116.838719.md"
