@@ -53,16 +53,17 @@ def _event(text: str, *, thread_id: str | None = "1781871116.838719") -> Message
 async def test_subject_set_jira_key_creates_thread_card(hermes_home):
     result = await SubjectHarness()._handle_subject_command(_event("/subject set MODS-12345"))
 
-    assert result == "```md\n# MODS-12345\n\nResources:\n  - jira:MODS-12345\n```"
+    expected = "```md\n---\nresources:\n  - jira:MODS-12345\n---\n\n# MODS-12345\n```"
+    assert result == expected
     card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "1781871116.838719.md"
-    assert card.read_text() == "# MODS-12345\n\nResources:\n  - jira:MODS-12345\n"
+    assert card.read_text() == "---\nresources:\n  - jira:MODS-12345\n---\n\n# MODS-12345\n"
 
 
 @pytest.mark.asyncio
 async def test_subject_set_typed_jira_resource_uses_issue_key_title(hermes_home):
     result = await SubjectHarness()._handle_subject_command(_event("/subject set jira:FB2B-1812"))
 
-    assert result == "```md\n# FB2B-1812\n\nResources:\n  - jira:FB2B-1812\n```"
+    assert result == "```md\n---\nresources:\n  - jira:FB2B-1812\n---\n\n# FB2B-1812\n```"
 
 
 @pytest.mark.asyncio
@@ -73,10 +74,12 @@ async def test_subject_set_extracts_inline_resources(hermes_home):
 
     expected = (
         "```md\n"
-        "# FALKE B2B Shop development channel\n\n"
-        "Resources:\n"
+        "---\n"
+        "resources:\n"
         "  - home:~/devel/falke-b2b-shop/\n"
         "  - jira:https://evenonsunday.atlassian.net/jira/software/c/projects/FB2B\n"
+        "---\n\n"
+        "# FALKE B2B Shop development channel\n"
         "```"
     )
     assert result == expected
@@ -174,7 +177,16 @@ async def test_subject_add_places_and_deduplicates_resources(hermes_home):
     await harness._handle_subject_command(_event("/subject add path:~/devel/oui-b2c-shop"))
     result = await harness._handle_subject_command(_event("/subject add path:~/devel/oui-b2c-shop"))
 
-    assert result == "```md\n# MODS-12345\n\nResources:\n  - jira:MODS-12345\n  - path:~/devel/oui-b2c-shop\n```"
+    assert result == (
+        "```md\n"
+        "---\n"
+        "resources:\n"
+        "  - jira:MODS-12345\n"
+        "  - path:~/devel/oui-b2c-shop\n"
+        "---\n\n"
+        "# MODS-12345\n"
+        "```"
+    )
 
 
 @pytest.mark.asyncio
@@ -195,13 +207,15 @@ async def test_subject_add_skill_formats_skills_block_before_resources(hermes_ho
 
     assert result == (
         "```md\n"
-        "# Seidensticker B2C Shop Development\n\n"
-        "Skills:\n"
-        "  - eos-shop-platform\n\n"
-        "Resources:\n"
+        "---\n"
+        "skills:\n"
+        "  - eos-shop-platform\n"
+        "resources:\n"
         "  - jira:<http://evenonsunday.atlassian.net/browse/SEID|evenonsunday.atlassian.net/browse/SEID>\n"
         "  - gh:even-on-sunday/seidensticker-b2c-shop\n"
         "  - path:/home/ewe/devel/seidensticker-b2c-shop\n"
+        "---\n\n"
+        "# Seidensticker B2C Shop Development\n"
         "```"
     )
     assert "`" not in card.read_text()
@@ -226,13 +240,15 @@ async def test_subject_add_skill_colon_migrates_legacy_inline_skill(hermes_home)
 
     assert result == (
         "```md\n"
-        "# Seidensticker B2C Shop Development\n\n"
-        "Skills:\n"
-        "  - eos-shop-platform\n\n"
-        "Resources:\n"
+        "---\n"
+        "skills:\n"
+        "  - eos-shop-platform\n"
+        "resources:\n"
         "  - jira:evenonsunday.atlassian.net/browse/SEID\n"
         "  - gh:even-on-sunday/seidensticker-b2c-shop\n"
         "  - path:/home/ewe/devel/seidensticker-b2c-shop\n"
+        "---\n\n"
+        "# Seidensticker B2C Shop Development\n"
         "```"
     )
 
@@ -261,12 +277,14 @@ async def test_subject_remove_skill_drops_empty_skills_block(hermes_home):
 
     assert result == (
         "```md\n"
-        "# Hermes Setup\n\n"
-        "Resources:\n"
+        "---\n"
+        "resources:\n"
         "  - path:/home/ewe/.hermes/hermes-agent\n"
+        "---\n\n"
+        "# Hermes Setup\n"
         "```"
     )
-    assert card.read_text() == "# Hermes Setup\n\nResources:\n  - path:/home/ewe/.hermes/hermes-agent\n"
+    assert card.read_text() == "---\nresources:\n  - path:/home/ewe/.hermes/hermes-agent\n---\n\n# Hermes Setup\n"
 
 
 @pytest.mark.asyncio
@@ -299,13 +317,15 @@ async def test_subject_set_preserves_existing_resources(hermes_home):
 
     assert result == (
         "```md\n"
-        "# Better subject\n\n"
-        "Skills:\n"
-        "  - eos-shop-platform\n\n"
-        "Tools:\n"
-        "  - mcp:phpstorm\n\n"
-        "Resources:\n"
+        "---\n"
+        "skills:\n"
+        "  - eos-shop-platform\n"
+        "tools:\n"
+        "  - mcp:phpstorm\n"
+        "resources:\n"
         "  - jira:MODS-12345\n"
+        "---\n\n"
+        "# Better subject\n"
         "```"
     )
 
@@ -324,14 +344,16 @@ async def test_subject_add_preserves_provided_resource_text_and_keeps_resources_
 
     assert result == (
         "```md\n"
-        "# Existing\n"
-        "Body line after old resources\n\n"
-        "Resources:\n"
+        "---\n"
+        "resources:\n"
         "  - jira:MODS-1\n"
         "  - gh:NousResearch/hermes-agent\n"
         "  - home:~/devel/hermes-agent\n"
         "  - obsidian:Hermes/Hermes Gateway Context Cards\n"
         "  - url:https://hermes-agent.nousresearch.com/docs\n"
+        "---\n\n"
+        "# Existing\n"
+        "Body line after old resources\n"
         "```"
     )
 
@@ -344,7 +366,7 @@ async def test_subject_get_migrates_legacy_anchor_label(hermes_home):
 
     result = await SubjectHarness()._handle_subject_command(_event("/subject get --scope"))
 
-    assert result == "```md\n# Legacy\n\nResources:\n  - jira:MODS-1\n```"
+    assert result == "```md\n---\nresources:\n  - jira:MODS-1\n---\n\n# Legacy\n```"
 
 
 @pytest.mark.asyncio
@@ -375,5 +397,5 @@ async def test_subject_update_can_remove_and_deduplicate_resources(hermes_home):
         _event("/subject update remove the jira resource and deduplicate resources")
     )
 
-    assert result == "```md\n# Existing\n\nResources:\n  - path:/home/ewe/devel/shop\n```"
-    assert card.read_text() == "# Existing\n\nResources:\n  - path:/home/ewe/devel/shop\n"
+    assert result == "```md\n---\nresources:\n  - path:/home/ewe/devel/shop\n---\n\n# Existing\n```"
+    assert card.read_text() == "---\nresources:\n  - path:/home/ewe/devel/shop\n---\n\n# Existing\n"

@@ -27,7 +27,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, cast
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
@@ -260,7 +260,13 @@ class GatewaySlashCommandsMixin:
     def _subject_card_is_safe(content: str) -> bool:
         """Validate minimal Gateway Context Card shape from the preprocessor."""
         stripped = (content or "").strip()
-        if not stripped or not stripped.startswith("# "):
+        body = stripped
+        if body.startswith("---\n"):
+            end = body.find("\n---", 4)
+            if end == -1:
+                return False
+            body = body[end + len("\n---"):].lstrip("\n")
+        if not body.strip().startswith("# "):
             return False
         banned = ("<script", "```", "<!--", "</")
         return not any(token in stripped.lower() for token in banned)
@@ -313,13 +319,14 @@ class GatewaySlashCommandsMixin:
                 "- Correct obvious typos and grammar.\n"
                 "- Optimize slightly for future agent use.\n"
                 "- Preserve meaning. Do not invent facts, do not broaden scope.\n"
-                "- Keep the subject and metadata as concise as possible.\n"
-                "- First line must be a level-1 Markdown heading.\n"
-                "- Put typed resources under a `Resources:` block at the end of the file.\n"
+                "- Keep the subject and frontmatter metadata as concise as possible.\n"
+                "- Body content must start with a level-1 Markdown heading after any frontmatter.\n"
+                "- Put typed resources in frontmatter under a `resources:` list, not a body `Resources:` block.\n"
+                "- Put skills/tools/toolsets in frontmatter lists (`skills:`, `tools:`, `toolsets:`), not body blocks.\n"
                 "- Supported resources: jira:, github:, gh:, path:, home:, url:, urn:, obsidian:.\n"
-                "- Treat Resources entries as opaque user-provided identifiers: do not resolve, normalize, retag, expand, or reformat them.\n"
-                "- For update instructions, the updated Resources block is authoritative; do not re-add old resources the user removed.\n"
-                "- If the input is only `jira:KEY`, use `# KEY` and `Resources: - jira:KEY`.\n"
+                "- Treat resource entries as opaque user-provided identifiers: do not resolve, normalize, retag, expand, or reformat them.\n"
+                "- For update instructions, the updated resources frontmatter is authoritative; do not re-add old resources the user removed.\n"
+                "- If the input is only `jira:KEY`, use body `# KEY` and frontmatter `resources: - jira:KEY`.\n"
                 "- Do not include internal file paths unless the user provided them as resources.\n\n"
                 f"Raw /subject set input:\n{description}\n\n"
                 f"Deterministic fallback card for reference:\n{fallback_content}"
@@ -417,6 +424,14 @@ class GatewaySlashCommandsMixin:
 
         resource_re = re.compile(r"^(jira|github|gh|path|home|url|urn|obsidian):(.+)$", re.IGNORECASE)
         skill_re = re.compile(r"^skill:\s*`?([^`\s]+)`?\s*$", re.IGNORECASE)
+        legacy_section_keys = {
+            "Skills:": "skills",
+            "Tools:": "tools",
+            "Toolsets:": "toolsets",
+            "Resources:": "resources",
+            "Anchor:": "resources",
+        }
+        frontmatter_order = ["scope_type", "include", "skills", "tools", "toolsets", "resources"]
 
         def _resource_from_line(line: str) -> str | None:
             line = line.strip()
@@ -428,114 +443,117 @@ class GatewaySlashCommandsMixin:
             match = skill_re.match(line.strip())
             return match.group(1) if match else None
 
-        def _migrate_resources_label(content: str) -> str:
-            return re.sub(r"(?m)^(\s*)Anchor:\s*$", r"\1Resources:", content or "")
+        def _empty_card() -> dict[str, Any]:
+            return {"meta": {}, "body": []}
 
-        def _split_resources(content: str) -> tuple[list[str], list[str]]:
-            lines = _migrate_resources_label(content).rstrip().splitlines() if (content or "").strip() else []
-            body: list[str] = []
-            resources: list[str] = []
-            i = 0
-            while i < len(lines):
-                if lines[i].strip() == "Resources:":
-                    i += 1
-                    while i < len(lines) and (lines[i].startswith("  - ") or lines[i].startswith("- ") or not lines[i].strip()):
-                        stripped = lines[i].strip()
-                        if stripped.startswith("- "):
-                            resource = _resource_from_line(stripped[2:].strip())
-                            if resource and resource not in resources:
-                                resources.append(resource)
-                        i += 1
-                    while body and not body[-1].strip():
-                        body.pop()
+        def _add_meta(meta: dict[str, Any], key: str, value: str) -> None:
+            value = value.strip().strip("`")
+            if not value:
+                return
+            values = meta.setdefault(key, [])
+            if isinstance(values, list) and value not in values:
+                values.append(value)
+
+        def _parse_frontmatter(raw: str) -> tuple[dict[str, Any], str]:
+            if not raw.startswith("---\n"):
+                return {}, raw
+            end = raw.find("\n---", 4)
+            if end == -1:
+                return {}, raw
+            front = raw[4:end].strip("\n")
+            body_start = end + len("\n---")
+            while body_start < len(raw) and raw[body_start:body_start + 1] == "\n":
+                body_start += 1
+            meta: dict[str, Any] = {}
+            key: str | None = None
+            for line in front.splitlines():
+                if not line.strip() or line.lstrip().startswith("#"):
                     continue
-                body.append(lines[i])
-                i += 1
-            return body, resources
+                m = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)$", line)
+                if m:
+                    key = m.group(1)
+                    value = m.group(2).strip().strip("'\"")
+                    if value:
+                        meta[key] = value
+                    else:
+                        assert key is not None
+                        meta.setdefault(key, [])
+                    continue
+                m = re.match(r"^\s*-\s*(.+)$", line)
+                if m and key:
+                    _add_meta(meta, key, m.group(1))
+            return meta, raw[body_start:]
 
-        def _split_skills(body_lines: list[str]) -> tuple[list[str], list[str]]:
+        def _parse_card(raw: str) -> dict[str, Any]:
+            meta, body_text = _parse_frontmatter(raw or "")
+            body_lines = body_text.rstrip().splitlines() if body_text.strip() else []
             body: list[str] = []
-            skills: list[str] = []
             i = 0
             while i < len(body_lines):
-                line = body_lines[i]
-                if line.strip() == "Skills:":
+                label = body_lines[i].strip()
+                key = legacy_section_keys.get(label)
+                if key:
                     i += 1
-                    while i < len(body_lines) and (body_lines[i].startswith("  - ") or body_lines[i].startswith("- ") or not body_lines[i].strip()):
+                    while i < len(body_lines) and (
+                        body_lines[i].startswith("  - ") or body_lines[i].startswith("- ") or not body_lines[i].strip()
+                    ):
                         stripped = body_lines[i].strip()
                         if stripped.startswith("- "):
-                            skill = stripped[2:].strip().strip("`")
-                            if skill and skill not in skills:
-                                skills.append(skill)
+                            value = stripped[2:].strip()
+                            if key == "resources":
+                                value = _resource_from_line(value) or value
+                            _add_meta(meta, key, value)
                         i += 1
                     while body and not body[-1].strip():
                         body.pop()
                     continue
-                skill = _skill_from_line(line)
+                skill = _skill_from_line(body_lines[i])
                 if skill:
-                    if skill not in skills:
-                        skills.append(skill)
+                    _add_meta(meta, "skills", skill)
                     i += 1
                     while i < len(body_lines) and not body_lines[i].strip():
                         i += 1
                     while body and not body[-1].strip():
                         body.pop()
                     continue
-                body.append(line)
+                body.append(body_lines[i])
                 i += 1
-            return body, skills
+            return {"meta": meta, "body": body}
 
-        def _render_card(body_lines: list[str], resources: list[str], skills: list[str] | None = None) -> str:
-            body = "\n".join(body_lines).rstrip()
-            content = body
-            if skills:
-                if content:
-                    content += "\n\n"
-                content += "Skills:\n" + "\n".join(f"  - {skill}" for skill in skills)
-            if resources:
-                if content:
-                    content += "\n\n"
-                content += "Resources:\n" + "\n".join(f"  - {resource}" for resource in resources)
+        def _render_frontmatter(meta: dict[str, Any]) -> str:
+            keys = [key for key in frontmatter_order if key in meta]
+            keys.extend(sorted(key for key in meta if key not in keys))
+            lines: list[str] = []
+            for key in keys:
+                value = meta.get(key)
+                if isinstance(value, list):
+                    values = [str(item).strip() for item in value if str(item).strip()]
+                    if not values:
+                        continue
+                    lines.append(f"{key}:")
+                    lines.extend(f"  - {item}" for item in values)
+                elif value not in (None, ""):
+                    lines.append(f"{key}: {value}")
+            if not lines:
+                return ""
+            return "---\n" + "\n".join(lines) + "\n---\n\n"
+
+        def _render_card(card: dict[str, Any]) -> str:
+            meta = cast(dict[str, Any], card.get("meta") if isinstance(card.get("meta"), dict) else {})
+            body_lines = card.get("body") if isinstance(card.get("body"), list) else []
+            body = "\n".join(str(line) for line in body_lines).rstrip()
+            content = _render_frontmatter(meta) + body
             return content.rstrip() + "\n" if content.strip() else ""
-
-        def _merge_resources(primary: list[str], preserved: list[str]) -> list[str]:
-            merged = list(primary)
-            for resource in preserved:
-                if resource not in merged:
-                    merged.append(resource)
-            return merged
-
-        def _preserve_metadata_blocks(body: list[str], existing_body: list[str]) -> list[str]:
-            preserved_labels = {"Skills:", "Tools:", "Toolsets:"}
-            present = {line.strip() for line in body if line.strip() in preserved_labels}
-            merged = list(body)
-            i = 0
-            while i < len(existing_body):
-                label = existing_body[i].strip()
-                if label not in preserved_labels or label in present:
-                    i += 1
-                    continue
-                block: list[str] = [existing_body[i]]
-                i += 1
-                while i < len(existing_body) and (
-                    existing_body[i].startswith("  - ") or existing_body[i].startswith("- ") or not existing_body[i].strip()
-                ):
-                    block.append(existing_body[i])
-                    i += 1
-                while merged and not merged[-1].strip():
-                    merged.pop()
-                if merged:
-                    merged.append("")
-                merged.extend(block)
-                present.add(label)
-            return merged
 
         def _card_from_description(description: str) -> str:
             desc = _normalize_description(description)
+            card = _empty_card()
             jira = re.fullmatch(r"[A-Z][A-Z0-9]+-\d+", desc)
             if jira:
                 key = jira.group(0)
-                return f"# {key}\n\nResources:\n  - jira:{key}\n"
+                card["body"] = [f"# {key}"]
+                _add_meta(card["meta"], "resources", f"jira:{key}")
+                return _render_card(card)
 
             resources: list[str] = []
             title_parts: list[str] = []
@@ -559,7 +577,11 @@ class GatewaySlashCommandsMixin:
                     title = jira_resource.group(1)
             if not title:
                 title = desc
-            return _render_card([f"# {title}"] if title else [], resources)
+            if title:
+                card["body"] = [f"# {title}"]
+            for resource in resources:
+                _add_meta(card["meta"], "resources", resource)
+            return _render_card(card)
 
         def _merge_card_update(
             existing: str,
@@ -567,57 +589,68 @@ class GatewaySlashCommandsMixin:
             *,
             preserve_existing_resources: bool = True,
         ) -> str:
-            existing_body, existing_resources = _split_resources(existing)
-            updated_body, updated_resources = _split_resources(updated)
-            body = _preserve_metadata_blocks(updated_body or existing_body, existing_body)
-            resources = (
-                _merge_resources(updated_resources, existing_resources)
-                if preserve_existing_resources
-                else updated_resources
-            )
-            return _render_card(body, resources)
+            existing_card = _parse_card(existing)
+            updated_card = _parse_card(updated)
+            existing_meta = existing_card["meta"]
+            updated_meta = updated_card["meta"]
+            merged_meta = dict(existing_meta)
+            for key, value in updated_meta.items():
+                if key == "resources" and preserve_existing_resources:
+                    merged_meta[key] = list(value) if isinstance(value, list) else value
+                    for item in existing_meta.get("resources", []) if isinstance(existing_meta.get("resources"), list) else []:
+                        _add_meta(merged_meta, "resources", str(item))
+                else:
+                    merged_meta[key] = value
+            if not preserve_existing_resources and "resources" in existing_meta and "resources" not in updated_meta:
+                merged_meta.pop("resources", None)
+            body = updated_card["body"] or existing_card["body"]
+            return _render_card({"meta": merged_meta, "body": body})
 
         def _add_to_card(existing: str, line: str) -> str:
             line = _normalize_description(line)
             if not line:
-                return _migrate_resources_label(existing).rstrip() + "\n"
-            existing = _migrate_resources_label(existing).rstrip()
-            if not existing:
+                return _render_card(_parse_card(existing))
+            if not (existing or "").strip():
                 return _card_from_description(line)
-            body, resources = _split_resources(existing)
+            card = _parse_card(existing)
+            meta = card["meta"]
             skill = _skill_from_line(line)
             if skill:
-                body, skills = _split_skills(body)
-                if skill not in skills:
-                    skills.append(skill)
-                return _render_card(body, resources, skills)
+                _add_meta(meta, "skills", skill)
+                return _render_card(card)
             resource = _resource_from_line(line)
             if resource:
-                if resource not in resources:
-                    resources.append(resource)
-                return _render_card(body, resources)
-            if any(l.strip() == line for l in body):
-                return _render_card(body, resources)
-            body.append(line)
-            return _render_card(body, resources)
+                _add_meta(meta, "resources", resource)
+                return _render_card(card)
+            body = card["body"]
+            if isinstance(body, list) and not any(str(l).strip() == line for l in body):
+                body.append(line)
+            return _render_card(card)
 
         def _remove_from_card(existing: str, line: str) -> str:
             line = _normalize_description(line)
-            existing = _migrate_resources_label(existing).rstrip()
-            if not line or not existing:
-                return existing + "\n" if existing else ""
-            body, resources = _split_resources(existing)
+            if not line or not (existing or "").strip():
+                return _render_card(_parse_card(existing))
+            card = _parse_card(existing)
+            meta = card["meta"]
             skill = _skill_from_line(line)
             if skill:
-                body, skills = _split_skills(body)
-                skills = [existing_skill for existing_skill in skills if existing_skill != skill]
-                return _render_card(body, resources, skills)
+                skills = meta.get("skills") if isinstance(meta.get("skills"), list) else []
+                meta["skills"] = [existing_skill for existing_skill in skills if existing_skill != skill]
+                if not meta["skills"]:
+                    meta.pop("skills", None)
+                return _render_card(card)
             resource = _resource_from_line(line)
             if resource:
-                resources = [existing_resource for existing_resource in resources if existing_resource != resource]
-                return _render_card(body, resources)
-            body = [body_line for body_line in body if body_line.strip() != line]
-            return _render_card(body, resources)
+                resources = meta.get("resources") if isinstance(meta.get("resources"), list) else []
+                meta["resources"] = [existing_resource for existing_resource in resources if existing_resource != resource]
+                if not meta["resources"]:
+                    meta.pop("resources", None)
+                return _render_card(card)
+            body = card["body"]
+            if isinstance(body, list):
+                card["body"] = [body_line for body_line in body if str(body_line).strip() != line]
+            return _render_card(card)
 
         if sub == "get":
             scope_only = "--scope" in rest
@@ -625,7 +658,8 @@ class GatewaySlashCommandsMixin:
             proc = await asyncio.to_thread(_run_context, cmd)
             if proc.returncode != 0:
                 return f"/subject get failed: `{(proc.stderr or proc.stdout).strip()}`"
-            return _code_fence(_migrate_resources_label(proc.stdout))
+            output = _render_card(_parse_card(proc.stdout)) if scope_only else proc.stdout
+            return _code_fence(output)
 
         if sub == "set":
             description = " ".join(rest).strip()
@@ -653,7 +687,7 @@ class GatewaySlashCommandsMixin:
             get_proc = await asyncio.to_thread(_run_context, ["get", "--scope", *scope_args])
             if get_proc.returncode != 0:
                 return f"/subject update failed: `{(get_proc.stderr or get_proc.stdout).strip()}`"
-            fallback_content = _migrate_resources_label(get_proc.stdout)
+            fallback_content = get_proc.stdout
             preprocessed = await self._preprocess_subject_card_with_agent(
                 event,
                 f"Existing card:\n{fallback_content}\n\nUpdate instruction:\n{instruction}",
