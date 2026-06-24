@@ -416,12 +416,17 @@ class GatewaySlashCommandsMixin:
             return re.sub(r"\\s+", " ", text.strip())
 
         resource_re = re.compile(r"^(jira|github|gh|path|home|url|urn|obsidian):(.+)$", re.IGNORECASE)
+        skill_re = re.compile(r"^skill:\s*`?([^`\s]+)`?\s*$", re.IGNORECASE)
 
         def _resource_from_line(line: str) -> str | None:
             line = line.strip()
             if re.fullmatch(r"[A-Z][A-Z0-9]+-\d+", line):
                 return f"jira:{line}"
             return line if resource_re.match(line) else None
+
+        def _skill_from_line(line: str) -> str | None:
+            match = skill_re.match(line.strip())
+            return match.group(1) if match else None
 
         def _migrate_resources_label(content: str) -> str:
             return re.sub(r"(?m)^(\s*)Anchor:\s*$", r"\1Resources:", content or "")
@@ -448,9 +453,45 @@ class GatewaySlashCommandsMixin:
                 i += 1
             return body, resources
 
-        def _render_card(body_lines: list[str], resources: list[str]) -> str:
+        def _split_skills(body_lines: list[str]) -> tuple[list[str], list[str]]:
+            body: list[str] = []
+            skills: list[str] = []
+            i = 0
+            while i < len(body_lines):
+                line = body_lines[i]
+                if line.strip() == "Skills:":
+                    i += 1
+                    while i < len(body_lines) and (body_lines[i].startswith("  - ") or body_lines[i].startswith("- ") or not body_lines[i].strip()):
+                        stripped = body_lines[i].strip()
+                        if stripped.startswith("- "):
+                            skill = stripped[2:].strip().strip("`")
+                            if skill and skill not in skills:
+                                skills.append(skill)
+                        i += 1
+                    while body and not body[-1].strip():
+                        body.pop()
+                    continue
+                skill = _skill_from_line(line)
+                if skill:
+                    if skill not in skills:
+                        skills.append(skill)
+                    i += 1
+                    while i < len(body_lines) and not body_lines[i].strip():
+                        i += 1
+                    while body and not body[-1].strip():
+                        body.pop()
+                    continue
+                body.append(line)
+                i += 1
+            return body, skills
+
+        def _render_card(body_lines: list[str], resources: list[str], skills: list[str] | None = None) -> str:
             body = "\n".join(body_lines).rstrip()
             content = body
+            if skills:
+                if content:
+                    content += "\n\n"
+                content += "Skills:\n" + "\n".join(f"  - {skill}" for skill in skills)
             if resources:
                 if content:
                     content += "\n\n"
@@ -544,6 +585,12 @@ class GatewaySlashCommandsMixin:
             if not existing:
                 return _card_from_description(line)
             body, resources = _split_resources(existing)
+            skill = _skill_from_line(line)
+            if skill:
+                body, skills = _split_skills(body)
+                if skill not in skills:
+                    skills.append(skill)
+                return _render_card(body, resources, skills)
             resource = _resource_from_line(line)
             if resource:
                 if resource not in resources:
