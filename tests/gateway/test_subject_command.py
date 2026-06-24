@@ -178,6 +178,66 @@ async def test_subject_add_places_and_deduplicates_resources(hermes_home):
 
 
 @pytest.mark.asyncio
+async def test_subject_add_skill_formats_skills_block_before_resources(hermes_home):
+    harness = SubjectHarness()
+    card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "1781871116.838719.md"
+    card.parent.mkdir(parents=True)
+    card.write_text(
+        "# Seidensticker B2C Shop Development\n\n"
+        "Resources:\n"
+        "  - jira:<http://evenonsunday.atlassian.net/browse/SEID|evenonsunday.atlassian.net/browse/SEID>\n"
+        "  - gh:even-on-sunday/seidensticker-b2c-shop\n"
+        "  - path:/home/ewe/devel/seidensticker-b2c-shop\n",
+        encoding="utf-8",
+    )
+
+    result = await harness._handle_subject_command(_event("/subject add skill:`eos-shop-platform`"))
+
+    assert result == (
+        "```md\n"
+        "# Seidensticker B2C Shop Development\n\n"
+        "Skills:\n"
+        "  - eos-shop-platform\n\n"
+        "Resources:\n"
+        "  - jira:<http://evenonsunday.atlassian.net/browse/SEID|evenonsunday.atlassian.net/browse/SEID>\n"
+        "  - gh:even-on-sunday/seidensticker-b2c-shop\n"
+        "  - path:/home/ewe/devel/seidensticker-b2c-shop\n"
+        "```"
+    )
+    assert "`" not in card.read_text()
+
+
+@pytest.mark.asyncio
+async def test_subject_add_skill_colon_migrates_legacy_inline_skill(hermes_home):
+    harness = SubjectHarness()
+    card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "1781871116.838719.md"
+    card.parent.mkdir(parents=True)
+    card.write_text(
+        "# Seidensticker B2C Shop Development\n"
+        "skill:`eos-shop-platform`\n\n"
+        "Resources:\n"
+        "  - jira:evenonsunday.atlassian.net/browse/SEID\n"
+        "  - gh:even-on-sunday/seidensticker-b2c-shop\n"
+        "  - path:/home/ewe/devel/seidensticker-b2c-shop\n",
+        encoding="utf-8",
+    )
+
+    result = await harness._handle_subject_command(_event("/subject add skill:eos-shop-platform"))
+
+    assert result == (
+        "```md\n"
+        "# Seidensticker B2C Shop Development\n\n"
+        "Skills:\n"
+        "  - eos-shop-platform\n\n"
+        "Resources:\n"
+        "  - jira:evenonsunday.atlassian.net/browse/SEID\n"
+        "  - gh:even-on-sunday/seidensticker-b2c-shop\n"
+        "  - path:/home/ewe/devel/seidensticker-b2c-shop\n"
+        "```"
+    )
+
+
+@pytest.mark.asyncio
 async def test_subject_set_preserves_existing_resources(hermes_home):
     harness = SubjectHarness()
     card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "1781871116.838719.md"
