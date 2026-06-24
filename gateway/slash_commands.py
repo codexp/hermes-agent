@@ -601,6 +601,24 @@ class GatewaySlashCommandsMixin:
             body.append(line)
             return _render_card(body, resources)
 
+        def _remove_from_card(existing: str, line: str) -> str:
+            line = _normalize_description(line)
+            existing = _migrate_resources_label(existing).rstrip()
+            if not line or not existing:
+                return existing + "\n" if existing else ""
+            body, resources = _split_resources(existing)
+            skill = _skill_from_line(line)
+            if skill:
+                body, skills = _split_skills(body)
+                skills = [existing_skill for existing_skill in skills if existing_skill != skill]
+                return _render_card(body, resources, skills)
+            resource = _resource_from_line(line)
+            if resource:
+                resources = [existing_resource for existing_resource in resources if existing_resource != resource]
+                return _render_card(body, resources)
+            body = [body_line for body_line in body if body_line.strip() != line]
+            return _render_card(body, resources)
+
         if sub == "get":
             scope_only = "--scope" in rest
             cmd = ["get"] + (["--scope"] if scope_only else []) + scope_args
@@ -660,7 +678,20 @@ class GatewaySlashCommandsMixin:
                 return f"/subject add failed: `{(set_proc.stderr or set_proc.stdout).strip()}`"
             return _code_fence(content)
 
-        return "Usage: /subject [get [--scope] | set <description> | update <instruction> | add {type}:{value}]"
+        if sub in {"remove", "unset"}:
+            line = " ".join(rest).strip()
+            if not line:
+                return f"Usage: /subject {sub} {{type}}:{{value}}"
+            get_proc = await asyncio.to_thread(_run_context, ["get", "--scope", *scope_args])
+            if get_proc.returncode != 0:
+                return f"/subject {sub} failed: `{(get_proc.stderr or get_proc.stdout).strip()}`"
+            content = _remove_from_card(get_proc.stdout, line)
+            set_proc = await asyncio.to_thread(_run_context, ["set", *scope_args, "--", content])
+            if set_proc.returncode != 0:
+                return f"/subject {sub} failed: `{(set_proc.stderr or set_proc.stdout).strip()}`"
+            return _code_fence(content)
+
+        return "Usage: /subject [get [--scope] | set <description> | update <instruction> | add {type}:{value} | remove {type}:{value} | unset {type}:{value}]"
 
     async def _handle_whoami_command(self, event: MessageEvent) -> str:
         """Handle /whoami — show the user's slash command access on this scope.
