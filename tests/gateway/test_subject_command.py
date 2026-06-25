@@ -35,18 +35,83 @@ def hermes_home(tmp_path, monkeypatch):
     yield home
 
 
-def _event(text: str, *, thread_id: str | None = "1781871116.838719") -> MessageEvent:
+def _event(
+    text: str,
+    *,
+    thread_id: str | None = "1781871116.838719",
+    chat_id: str = "C0BB6UUEQHM",
+    chat_name: str | None = None,
+) -> MessageEvent:
     return MessageEvent(
         text=text,
         source=SessionSource(
             platform=Platform.SLACK,
-            chat_id="C0BB6UUEQHM",
+            chat_id=chat_id,
+            chat_name=chat_name,
             chat_type="group",
             user_id="U123",
             guild_id="T123",
             thread_id=thread_id,
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_setup_adds_free_response_channel_and_creates_channel_card(hermes_home):
+    (hermes_home / "config.yaml").write_text(
+        "slack:\n  free_response_channels: COLD\n",
+        encoding="utf-8",
+    )
+
+    result = await SubjectHarness()._handle_setup_command(
+        _event("/setup", thread_id="1781871116.838719", chat_name="hermes-setup")
+    )
+
+    assert "Slack channel setup complete" in result
+    assert "`C0BB6UUEQHM` is added" in result
+    assert "Restart required" in result
+    config_text = (hermes_home / "config.yaml").read_text(encoding="utf-8")
+    assert "free_response_channels:" in config_text
+    assert "  - COLD" in config_text
+    assert "  - C0BB6UUEQHM" in config_text
+    card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "MAIN.md"
+    assert card.read_text(encoding="utf-8") == "# hermes-setup\n\nThis channel is for hermes-setup.\n"
+
+
+@pytest.mark.asyncio
+async def test_setup_infers_shop_scope_and_preserves_existing_resources(hermes_home, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    shop = tmp_path / "devel" / "falke-b2b-shop"
+    shop.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=shop, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:even-on-sunday/falke-b2b-shop.git"],
+        cwd=shop,
+        check=True,
+    )
+    script = hermes_home / "gateway-context" / "script" / "context"
+    existing = "---\nresources:\n  - jira:FB2B\n---\n\n# Old title\n"
+    subprocess.run(
+        [str(script), "set", "slack", "T123", "C123SHOP", "--", existing],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={"HERMES_HOME": str(hermes_home)},
+    )
+
+    result = await SubjectHarness()._handle_setup_command(
+        _event("/setup", thread_id=None, chat_id="C123SHOP", chat_name="falke-b2b-shop")
+    )
+
+    assert "scope_type: `eos-shop`" in result
+    card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C123SHOP" / "MAIN.md"
+    text = card.read_text(encoding="utf-8")
+    assert "scope_type: eos-shop" in text
+    assert "  - jira:FB2B" in text
+    assert f"  - path:{shop}" in text
+    assert "  - gh:even-on-sunday/falke-b2b-shop" in text
+    assert "# falke-b2b-shop development" in text
 
 
 @pytest.mark.asyncio
@@ -259,8 +324,44 @@ async def test_subject_unknown_subcommand_usage_mentions_remove_and_unset(hermes
 
     assert result == (
         "Usage: /subject [get [--scope] | set <description> | update <instruction> | "
-        "add {type}:{value} | remove {type}:{value} | unset {type}:{value}]"
+        "add {type}:{value} | remove {type}:{value} | unset {type}:{value} | clear]"
     )
+
+
+@pytest.mark.asyncio
+async def test_subject_clear_deletes_current_thread_card(hermes_home):
+    harness = SubjectHarness()
+    card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "1781871116.838719.md"
+    card.parent.mkdir(parents=True)
+    card.write_text("# Thread card\n", encoding="utf-8")
+    channel_card = card.parent / "MAIN.md"
+    channel_card.write_text("# Channel card\n", encoding="utf-8")
+
+    result = await harness._handle_subject_command(_event("/subject clear"))
+
+    assert result == "Subject card cleared."
+    assert not card.exists()
+    assert channel_card.exists()
+
+
+@pytest.mark.asyncio
+async def test_subject_clear_deletes_channel_card_from_channel_scope(hermes_home):
+    harness = SubjectHarness()
+    card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "MAIN.md"
+    card.parent.mkdir(parents=True)
+    card.write_text("# Channel card\n", encoding="utf-8")
+
+    result = await harness._handle_subject_command(_event("/subject clear", thread_id=None))
+
+    assert result == "Subject card cleared."
+    assert not card.exists()
+
+
+@pytest.mark.asyncio
+async def test_subject_clear_missing_card_is_noop(hermes_home):
+    result = await SubjectHarness()._handle_subject_command(_event("/subject clear"))
+
+    assert result == "No subject card exists for this scope."
 
 
 @pytest.mark.asyncio
