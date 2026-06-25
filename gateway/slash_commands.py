@@ -382,9 +382,38 @@ class GatewaySlashCommandsMixin:
         if not channel_id:
             return "Slack channel setup failed: current channel ID is unavailable."
 
-        raw_name = (source.chat_name or "").strip()
-        channel_name = raw_name.lstrip("#") if raw_name and raw_name != channel_id else channel_id
-        explicit_scope_type = event.get_command_args().strip()
+        usage = "Usage: /setup <channel name> [type:<scope-type>] [gh:<urn>|github:<urn>] [path:<path>|dir:<path>]"
+        try:
+            setup_args = shlex.split(event.get_command_args().strip()) if event.get_command_args().strip() else []
+        except ValueError as exc:
+            return f"Invalid /setup arguments: {exc}"
+        if not setup_args:
+            return usage
+
+        channel_name = setup_args[0].strip().lstrip("#")
+        if not channel_name:
+            return usage
+
+        explicit_scope_type = ""
+        resources: list[str] = []
+        supported_args = "type:<scope-type>, gh:<urn>, github:<urn>, path:<path>, dir:<path>"
+        for arg in setup_args[1:]:
+            if ":" not in arg:
+                return f"Unknown /setup argument `{arg}`. Supported arguments: {supported_args}."
+            key, value = arg.split(":", 1)
+            key = key.strip().lower()
+            value = value.strip()
+            if not value:
+                return f"Invalid /setup argument `{arg}`: value is required. Supported arguments: {supported_args}."
+            if key == "type":
+                explicit_scope_type = value
+            elif key in {"gh", "github"}:
+                resources.append(f"gh:{value}")
+            elif key in {"path", "dir"}:
+                resources.append(f"path:{value}")
+            else:
+                return f"Unknown /setup argument `{arg}`. Supported arguments: {supported_args}."
+
         inferred_shop = channel_name.endswith("-shop") and not explicit_scope_type
         scope_type = explicit_scope_type or ("eos-shop" if inferred_shop else "")
 
@@ -420,7 +449,6 @@ class GatewaySlashCommandsMixin:
             channels.append(channel_id)
             atomic_roundtrip_yaml_update(config_path, "slack.free_response_channels", channels)
 
-        resources: list[str] = []
         if channel_name.endswith("-shop"):
             shop_path = Path.home() / "devel" / channel_name
             if shop_path.is_dir():
@@ -520,14 +548,29 @@ class GatewaySlashCommandsMixin:
         if set_proc.returncode != 0:
             return f"Slack channel setup failed while writing context card: `{(set_proc.stderr or set_proc.stdout).strip()}`"
 
+        context_applied = False
+        applied_proc = await asyncio.to_thread(_run_context, ["get", *scope_args])
+        if applied_proc.returncode == 0 and (applied_proc.stdout or "").strip():
+            context_applied = True
+            session_key_func = getattr(self, "_session_key_for_source", None)
+            evict_cached_agent = getattr(self, "_evict_cached_agent", None)
+            try:
+                session_key = session_key_func(source) if callable(session_key_func) else build_session_key(source)
+            except Exception:
+                session_key = ""
+            if session_key and callable(evict_cached_agent):
+                evict_cached_agent(session_key)
+
         changed = "added" if added_channel else "already present"
         resource_line = ", ".join(resources) if resources else "none discovered"
         scope_line = scope_type or "none"
+        applied_line = "- Applied updated channel context from `/subject get`.\n" if context_applied else ""
         return (
             "✅ Slack channel setup complete.\n"
             f"- Channel `{channel_id}` is {changed} in `slack.free_response_channels`.\n"
             f"- Channel card: `{title}` (scope_type: `{scope_line}`).\n"
             f"- Resources: {resource_line}.\n"
+            f"{applied_line}"
             "- Restart required for free-response config: run `/restart` or `hermes gateway restart`."
         )
 
@@ -826,6 +869,8 @@ class GatewaySlashCommandsMixin:
             proc = await asyncio.to_thread(_run_context, cmd)
             if proc.returncode != 0:
                 return f"/subject get failed: `{(proc.stderr or proc.stdout).strip()}`"
+            if not (proc.stdout or "").strip():
+                return "Context file not found"
             output = _render_card(_parse_card(proc.stdout)) if scope_only else proc.stdout
             return _code_fence(output)
 
