@@ -363,6 +363,174 @@ class GatewaySlashCommandsMixin:
             logger.warning("/subject set agent preprocessing failed, using deterministic fallback: %s", exc)
             return fallback_content
 
+    async def _handle_setup_command(self, event: MessageEvent) -> str:
+        """Set up the current Slack channel for free-response context-card use.
+
+        This implements the Slack channel setup workflow described by the
+        ``slack-channel-setup`` skill: add the current channel ID to
+        ``slack.free_response_channels`` and create/update the channel-scope
+        Gateway Context Card. It intentionally targets the channel card even
+        when invoked from a thread.
+        """
+        import subprocess
+
+        source = event.source
+        if source.platform != Platform.SLACK:
+            return "`/setup` currently supports Slack channels only."
+
+        channel_id = source.parent_chat_id or source.chat_id
+        if not channel_id:
+            return "Slack channel setup failed: current channel ID is unavailable."
+
+        raw_name = (source.chat_name or "").strip()
+        channel_name = raw_name.lstrip("#") if raw_name and raw_name != channel_id else channel_id
+        explicit_scope_type = event.get_command_args().strip()
+        inferred_shop = channel_name.endswith("-shop") and not explicit_scope_type
+        scope_type = explicit_scope_type or ("eos-shop" if inferred_shop else "")
+
+        title = f"{channel_name} development" if inferred_shop else channel_name
+        body = f"# {title}\n\nThis channel is for {title}.\n"
+
+        from hermes_constants import get_hermes_home
+        from ruamel.yaml import YAML
+        from utils import atomic_roundtrip_yaml_update
+
+        hermes_home = get_hermes_home()
+        config_path = hermes_home / "config.yaml"
+
+        yaml_rt = YAML(typ="safe")
+        config: dict[str, Any] = {}
+        if config_path.exists():
+            loaded = yaml_rt.load(config_path.read_text(encoding="utf-8")) or {}
+            if isinstance(loaded, dict):
+                config = loaded
+        slack_cfg = config.get("slack") if isinstance(config.get("slack"), dict) else {}
+        existing_raw = slack_cfg.get("free_response_channels", "") if isinstance(slack_cfg, dict) else ""
+
+        def _channel_list(raw: Any) -> list[str]:
+            if isinstance(raw, list):
+                return [str(item).strip() for item in raw if str(item).strip()]
+            if raw is None:
+                return []
+            return [part.strip() for part in str(raw).split(",") if part.strip()]
+
+        channels = _channel_list(existing_raw)
+        added_channel = channel_id not in channels
+        if added_channel:
+            channels.append(channel_id)
+            atomic_roundtrip_yaml_update(config_path, "slack.free_response_channels", channels)
+
+        resources: list[str] = []
+        if channel_name.endswith("-shop"):
+            shop_path = Path.home() / "devel" / channel_name
+            if shop_path.is_dir():
+                resources.append(f"path:{shop_path}")
+                try:
+                    remote_proc = await asyncio.to_thread(
+                        subprocess.run,
+                        ["git", "remote", "get-url", "origin"],
+                        cwd=str(shop_path),
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=5,
+                        check=False,
+                    )
+                    if remote_proc.returncode == 0:
+                        remote = (remote_proc.stdout or "").strip()
+                        match = re.search(r"github\.com[:/](?P<repo>[^\s/]+/[^\s/]+?)(?:\.git)?$", remote)
+                        if match:
+                            resources.append(f"gh:{match.group('repo')}")
+                except Exception:
+                    logger.debug("/setup shop origin discovery failed", exc_info=True)
+
+        def _parse_card(raw: str) -> tuple[dict[str, Any], str]:
+            if not raw.startswith("---\n"):
+                return {}, raw
+            end = raw.find("\n---", 4)
+            if end == -1:
+                return {}, raw
+            front = raw[4:end].strip("\n")
+            body_start = end + len("\n---")
+            while body_start < len(raw) and raw[body_start:body_start + 1] == "\n":
+                body_start += 1
+            parsed = yaml_rt.load(front) or {}
+            return (parsed if isinstance(parsed, dict) else {}), raw[body_start:]
+
+        def _dedupe(values: list[str]) -> list[str]:
+            seen: set[str] = set()
+            result: list[str] = []
+            for value in values:
+                if value and value not in seen:
+                    seen.add(value)
+                    result.append(value)
+            return result
+
+        def _render_card(meta: dict[str, Any], body_text: str) -> str:
+            ordered = ["scope_type", "include", "skills", "tools", "toolsets", "resources"]
+            keys = [key for key in ordered if key in meta]
+            keys.extend(sorted(key for key in meta if key not in keys))
+            lines: list[str] = []
+            for key in keys:
+                value = meta.get(key)
+                if isinstance(value, list):
+                    values = [str(item).strip() for item in value if str(item).strip()]
+                    if not values:
+                        continue
+                    lines.append(f"{key}:")
+                    lines.extend(f"  - {item}" for item in values)
+                elif value not in (None, ""):
+                    lines.append(f"{key}: {value}")
+            frontmatter = "---\n" + "\n".join(lines) + "\n---\n\n" if lines else ""
+            return (frontmatter + body_text.rstrip() + "\n") if (frontmatter or body_text.strip()) else ""
+
+        script = hermes_home / "gateway-context" / "script" / "context"
+        if not script.exists():
+            return f"Slack channel setup partially complete: config updated, but Gateway context script not found: `{script}`"
+
+        platform = source.platform.value
+        workspace_id = source.guild_id or "_default"
+        scope_args = [platform, str(workspace_id), str(channel_id)]
+
+        def _run_context(cmd_args: list[str]) -> subprocess.CompletedProcess[str]:
+            env = os.environ.copy()
+            env["HERMES_HOME"] = str(hermes_home)
+            env.pop("HERMES_GATEWAY_CONTEXT_HOME", None)
+            return subprocess.run(
+                [str(script), *cmd_args],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                check=False,
+                env=env,
+            )
+
+        get_proc = await asyncio.to_thread(_run_context, ["get", "--scope", *scope_args])
+        if get_proc.returncode != 0:
+            return f"Slack channel setup failed while reading context card: `{(get_proc.stderr or get_proc.stdout).strip()}`"
+        meta, _existing_body = _parse_card(get_proc.stdout or "")
+        if scope_type:
+            meta["scope_type"] = scope_type
+        if resources:
+            existing_resources = meta.get("resources") if isinstance(meta.get("resources"), list) else []
+            meta["resources"] = _dedupe([str(item) for item in existing_resources] + resources)
+        content = _render_card(meta, body)
+        set_proc = await asyncio.to_thread(_run_context, ["set", *scope_args, "--", content])
+        if set_proc.returncode != 0:
+            return f"Slack channel setup failed while writing context card: `{(set_proc.stderr or set_proc.stdout).strip()}`"
+
+        changed = "added" if added_channel else "already present"
+        resource_line = ", ".join(resources) if resources else "none discovered"
+        scope_line = scope_type or "none"
+        return (
+            "✅ Slack channel setup complete.\n"
+            f"- Channel `{channel_id}` is {changed} in `slack.free_response_channels`.\n"
+            f"- Channel card: `{title}` (scope_type: `{scope_line}`).\n"
+            f"- Resources: {resource_line}.\n"
+            "- Restart required for free-response config: run `/restart` or `hermes gateway restart`."
+        )
+
     async def _handle_subject_command(self, event: MessageEvent) -> str:
         """Handle /subject for Gateway Context Cards.
 
@@ -661,6 +829,21 @@ class GatewaySlashCommandsMixin:
             output = _render_card(_parse_card(proc.stdout)) if scope_only else proc.stdout
             return _code_fence(output)
 
+        if sub == "clear":
+            if rest:
+                return "Usage: /subject clear"
+            path_proc = await asyncio.to_thread(_run_context, ["path", *scope_args])
+            if path_proc.returncode != 0:
+                return f"/subject clear failed: `{(path_proc.stderr or path_proc.stdout).strip()}`"
+            card_path = Path((path_proc.stdout or "").strip()).expanduser()
+            if not card_path.exists():
+                return "No subject card exists for this scope."
+            try:
+                card_path.unlink()
+            except OSError as exc:
+                return f"/subject clear failed: `{exc}`"
+            return "Subject card cleared."
+
         if sub == "set":
             description = " ".join(rest).strip()
             if not description:
@@ -725,7 +908,7 @@ class GatewaySlashCommandsMixin:
                 return f"/subject {sub} failed: `{(set_proc.stderr or set_proc.stdout).strip()}`"
             return _code_fence(content)
 
-        return "Usage: /subject [get [--scope] | set <description> | update <instruction> | add {type}:{value} | remove {type}:{value} | unset {type}:{value}]"
+        return "Usage: /subject [get [--scope] | set <description> | update <instruction> | add {type}:{value} | remove {type}:{value} | unset {type}:{value} | clear]"
 
     async def _handle_whoami_command(self, event: MessageEvent) -> str:
         """Handle /whoami — show the user's slash command access on this scope.

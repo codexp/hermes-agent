@@ -70,8 +70,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("topic", "Enable or inspect Telegram DM topic sessions", "Session",
                gateway_only=True, args_hint="[off|help|session-id]"),
     CommandDef("subject", "Manage Gateway Context Cards for this channel or thread", "Session",
-               gateway_only=True, args_hint="[get [--scope]|set <description>|update <instruction>|add {type}:{value}|remove {type}:{value}|unset {type}:{value}]",
-               subcommands=("get", "set", "update", "add", "remove", "unset")),
+               gateway_only=True, args_hint="[get [--scope]|set <description>|update <instruction>|add {type}:{value}|remove {type}:{value}|unset {type}:{value}|clear]",
+               subcommands=("get", "set", "update", "add", "remove", "unset", "clear")),
+    CommandDef("setup", "Set up the current Slack channel for free-response and context cards", "Session",
+               gateway_only=True, args_hint="[channel-type]"),
     CommandDef("clear", "Clear screen and start a new session", "Session",
                cli_only=True),
     CommandDef("redraw", "Force a full UI repaint (recovers from terminal drift)", "Session",
@@ -370,6 +372,7 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
         "steer",
         "stop",
         "subject",
+        "setup",
         "update",
         "version",
     }
@@ -1064,7 +1067,9 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - credits: the billing/top-up surface; reached via /hermes credits on Slack.
 #   - billing: the terminal-billing surface (buy/auto-reload/limit); /hermes billing.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "debug"})
+#   - version: low-frequency info command; reached via /hermes version on Slack,
+#     keeping a native slot for the channel-onboarding /setup command.
+_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "debug", "version"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

@@ -3667,8 +3667,10 @@ class SlackAdapter(BasePlatformAdapter):
         # keep group semantics so different users do not collide into one
         # session key.
         is_dm = str(channel_id).startswith("D")
+        channel_name = (command.get("channel_name") or "").strip() or channel_id
         source = self.build_source(
             chat_id=channel_id,
+            chat_name=channel_name,
             chat_type="dm" if is_dm else "group",
             user_id=user_id,
             guild_id=team_id or None,
