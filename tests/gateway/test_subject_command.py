@@ -16,6 +16,17 @@ class SubjectHarness(GatewaySlashCommandsMixin):
     pass
 
 
+class SetupApplyHarness(GatewaySlashCommandsMixin):
+    def __init__(self):
+        self.evicted: list[str] = []
+
+    def _session_key_for_source(self, source: SessionSource) -> str:
+        return "session-key"
+
+    def _evict_cached_agent(self, session_key: str) -> None:
+        self.evicted.append(session_key)
+
+
 class SubjectPreprocessHarness(GatewaySlashCommandsMixin):
     def __init__(self, output: str):
         self._subject_preprocess_override = lambda description, fallback: output
@@ -64,7 +75,7 @@ async def test_setup_adds_free_response_channel_and_creates_channel_card(hermes_
     )
 
     result = await SubjectHarness()._handle_setup_command(
-        _event("/setup", thread_id="1781871116.838719", chat_name="hermes-setup")
+        _event("/setup hermes-setup", thread_id="1781871116.838719")
     )
 
     assert "Slack channel setup complete" in result
@@ -76,6 +87,72 @@ async def test_setup_adds_free_response_channel_and_creates_channel_card(hermes_
     assert "  - C0BB6UUEQHM" in config_text
     card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "MAIN.md"
     assert card.read_text(encoding="utf-8") == "# hermes-setup\n\nThis channel is for hermes-setup.\n"
+
+
+@pytest.mark.asyncio
+async def test_setup_applies_subject_get_by_evicting_cached_agent(hermes_home):
+    harness = SetupApplyHarness()
+
+    result = await harness._handle_setup_command(
+        _event("/setup hermes-setup", thread_id="1781871116.838719")
+    )
+
+    assert "Applied updated channel context from `/subject get`" in result
+    assert harness.evicted == ["session-key"]
+
+
+@pytest.mark.asyncio
+async def test_setup_requires_channel_name_argument(hermes_home):
+    (hermes_home / "config.yaml").write_text(
+        "slack:\n  free_response_channels: []\n",
+        encoding="utf-8",
+    )
+
+    result = await SubjectHarness()._handle_setup_command(
+        _event("/setup", thread_id=None, chat_id="C0BD7ABQWTE")
+    )
+
+    assert result == "Usage: /setup <channel name> [type:<scope-type>] [gh:<urn>|github:<urn>] [path:<path>|dir:<path>]"
+    config_text = (hermes_home / "config.yaml").read_text(encoding="utf-8")
+    assert "C0BD7ABQWTE" not in config_text
+    card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BD7ABQWTE" / "MAIN.md"
+    assert not card.exists()
+
+
+@pytest.mark.asyncio
+async def test_setup_errors_on_unknown_argument(hermes_home):
+    result = await SubjectHarness()._handle_setup_command(
+        _event("/setup hermes-setup nope:value", thread_id=None, chat_id="C123")
+    )
+
+    assert result == "Unknown /setup argument `nope:value`. Supported arguments: type:<scope-type>, gh:<urn>, github:<urn>, path:<path>, dir:<path>."
+    card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C123" / "MAIN.md"
+    assert not card.exists()
+
+
+@pytest.mark.asyncio
+async def test_setup_arguments_are_written_to_frontmatter(hermes_home):
+    result = await SubjectHarness()._handle_setup_command(
+        _event(
+            "/setup ticket-context type:jira-ticket github:codexp/hermes-agent dir:/home/ewe/.hermes/hermes-agent",
+            thread_id=None,
+            chat_id="C123",
+        )
+    )
+
+    assert "scope_type: `jira-ticket`" in result
+    assert "gh:codexp/hermes-agent, path:/home/ewe/.hermes/hermes-agent" in result
+    card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C123" / "MAIN.md"
+    assert card.read_text(encoding="utf-8") == (
+        "---\n"
+        "scope_type: jira-ticket\n"
+        "resources:\n"
+        "  - gh:codexp/hermes-agent\n"
+        "  - path:/home/ewe/.hermes/hermes-agent\n"
+        "---\n\n"
+        "# ticket-context\n\n"
+        "This channel is for ticket-context.\n"
+    )
 
 
 @pytest.mark.asyncio
@@ -101,7 +178,7 @@ async def test_setup_infers_shop_scope_and_preserves_existing_resources(hermes_h
     )
 
     result = await SubjectHarness()._handle_setup_command(
-        _event("/setup", thread_id=None, chat_id="C123SHOP", chat_name="falke-b2b-shop")
+        _event("/setup falke-b2b-shop", thread_id=None, chat_id="C123SHOP")
     )
 
     assert "scope_type: `eos-shop`" in result
@@ -232,6 +309,15 @@ async def test_subject_get_defaults_to_resolved_bundle_and_scope_is_local(hermes
     assert "MAIN.md" not in full
     assert full.index("# Thread") < full.index("# Channel") < full.index("# Global") < full.index("# Slack gateway")
     assert scoped == "```md\n# Thread\n```"
+
+
+@pytest.mark.asyncio
+async def test_subject_get_missing_context_returns_message_not_empty_fence(hermes_home):
+    result = await SubjectHarness()._handle_subject_command(_event("/subject get"))
+    scoped = await SubjectHarness()._handle_subject_command(_event("/subject get --scope"))
+
+    assert result == "Context file not found"
+    assert scoped == "Context file not found"
 
 
 @pytest.mark.asyncio
