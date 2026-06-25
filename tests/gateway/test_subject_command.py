@@ -86,7 +86,7 @@ async def test_setup_adds_free_response_channel_and_creates_channel_card(hermes_
     assert "  - COLD" in config_text
     assert "  - C0BB6UUEQHM" in config_text
     card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "MAIN.md"
-    assert card.read_text(encoding="utf-8") == "# hermes-setup\n\nThis channel is for hermes-setup.\n"
+    assert card.read_text(encoding="utf-8") == "# hermes-setup\n"
 
 
 @pytest.mark.asyncio
@@ -150,8 +150,36 @@ async def test_setup_arguments_are_written_to_frontmatter(hermes_home):
         "  - gh:codexp/hermes-agent\n"
         "  - path:/home/ewe/.hermes/hermes-agent\n"
         "---\n\n"
-        "# ticket-context\n\n"
-        "This channel is for ticket-context.\n"
+        "# ticket-context\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_setup_explicit_shop_type_appends_development_for_existing_project(hermes_home, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    shop = tmp_path / "devel" / "oui-b2c-shop"
+    shop.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=shop, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "git@github.com:even-on-sunday/oui-b2c-shop.git"],
+        cwd=shop,
+        check=True,
+    )
+
+    result = await SubjectHarness()._handle_setup_command(
+        _event("/setup oui-b2c-shop type:eos-shop", thread_id=None, chat_id="COUI")
+    )
+
+    assert "scope_type: `eos-shop`" in result
+    card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "COUI" / "MAIN.md"
+    assert card.read_text(encoding="utf-8") == (
+        "---\n"
+        "scope_type: eos-shop\n"
+        "resources:\n"
+        f"  - path:{shop}\n"
+        "  - gh:even-on-sunday/oui-b2c-shop\n"
+        "---\n\n"
+        "# oui-b2c-shop development\n"
     )
 
 

@@ -414,11 +414,13 @@ class GatewaySlashCommandsMixin:
             else:
                 return f"Unknown /setup argument `{arg}`. Supported arguments: {supported_args}."
 
+        project_path = Path.home() / "devel" / channel_name
+        project_exists = project_path.is_dir()
         inferred_shop = channel_name.endswith("-shop") and not explicit_scope_type
         scope_type = explicit_scope_type or ("eos-shop" if inferred_shop else "")
 
-        title = f"{channel_name} development" if inferred_shop else channel_name
-        body = f"# {title}\n\nThis channel is for {title}.\n"
+        title = f"{channel_name} development" if project_exists else channel_name
+        body = f"# {title}\n"
 
         from hermes_constants import get_hermes_home
         from ruamel.yaml import YAML
@@ -450,14 +452,13 @@ class GatewaySlashCommandsMixin:
             atomic_roundtrip_yaml_update(config_path, "slack.free_response_channels", channels)
 
         if channel_name.endswith("-shop"):
-            shop_path = Path.home() / "devel" / channel_name
-            if shop_path.is_dir():
-                resources.append(f"path:{shop_path}")
+            if project_exists:
+                resources.append(f"path:{project_path}")
                 try:
                     remote_proc = await asyncio.to_thread(
                         subprocess.run,
                         ["git", "remote", "get-url", "origin"],
-                        cwd=str(shop_path),
+                        cwd=str(project_path),
                         text=True,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
