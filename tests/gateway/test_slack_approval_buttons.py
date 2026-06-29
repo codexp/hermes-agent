@@ -208,6 +208,46 @@ class TestSlackApprovalAction:
         assert "Approved once by norbert" in update_kwargs["text"]
 
     @pytest.mark.asyncio
+    async def test_truncates_oversized_returned_block_text_before_update(self):
+        """Slack may return mrkdwn/entity-expanded block text in action payloads.
+
+        The click handler must re-apply the 3000-char section cap before
+        chat.update, otherwise Slack rejects the update and leaves buttons live.
+        """
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        adapter._approval_resolved["1234.5678"] = False
+
+        ack = AsyncMock()
+        oversized = "x" * 3001
+        body = {
+            "message": {
+                "ts": "1234.5678",
+                "blocks": [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": oversized}},
+                    {"type": "actions", "elements": []},
+                ],
+            },
+            "channel": {"id": "C1"},
+            "user": {"name": "norbert", "id": "U_NORBERT"},
+        }
+        action = {
+            "action_id": "hermes_approve_once",
+            "value": "agent:main:slack:group:C1:1111",
+        }
+
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_update = AsyncMock()
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1):
+            await adapter._handle_approval_action(ack, body, action)
+
+        updated_blocks = mock_client.chat_update.call_args[1]["blocks"]
+        section_text = updated_blocks[0]["text"]["text"]
+        assert len(section_text) <= 3000
+        assert section_text.endswith("...")
+
+    @pytest.mark.asyncio
     async def test_prevents_double_click(self):
         adapter = _make_adapter()
         _attach_auth_runner(adapter)
@@ -307,6 +347,7 @@ class TestSlackInteractiveAuth:
 
 
 class TestSlackSlashConfirmAction:
+
     @pytest.mark.asyncio
     async def test_global_allowlist_allows_authorized_click(self, monkeypatch):
         adapter = _make_adapter()
@@ -345,6 +386,42 @@ class TestSlackSlashConfirmAction:
         )
         mock_client.chat_update.assert_called_once()
         mock_client.chat_postMessage.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_truncates_oversized_returned_block_text_before_update(self, monkeypatch):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_update = AsyncMock()
+        mock_client.chat_postMessage = AsyncMock()
+        monkeypatch.delenv("SLACK_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("SLACK_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "U_OWNER")
+
+        ack = AsyncMock()
+        oversized = "x" * 3001
+        body = {
+            "message": {
+                "ts": "2222.3333",
+                "blocks": [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": oversized}},
+                ],
+            },
+            "channel": {"id": "C1"},
+            "user": {"name": "owner", "id": "U_OWNER"},
+        }
+        action = {
+            "action_id": "hermes_confirm_once",
+            "value": "agent:main:slack:group:C1:1111|confirm-1",
+        }
+
+        with patch("tools.slash_confirm.resolve", new=AsyncMock(return_value="follow-up")):
+            await adapter._handle_slash_confirm_action(ack, body, action)
+
+        updated_blocks = mock_client.chat_update.call_args[1]["blocks"]
+        section_text = updated_blocks[0]["text"]["text"]
+        assert len(section_text) <= 3000
+        assert section_text.endswith("...")
 
 
 # ===========================================================================
