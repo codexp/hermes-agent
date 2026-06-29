@@ -3146,6 +3146,20 @@ class SlackAdapter(BasePlatformAdapter):
             logger.error("[Slack] send_slash_confirm failed: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
+    @staticmethod
+    def _truncate_section_block_text(text: str, limit: int = 3000) -> str:
+        """Return text safe for Slack section-block ``text.text``.
+
+        Slack accepts at most 3000 characters in a section text field. Action
+        payloads may return the original block text after mrkdwn/entity
+        normalization (for example ``<`` as ``&lt;``), so update handlers must
+        re-budget the payload copy before sending it back via ``chat.update``.
+        """
+        text = str(text or "")
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 3)].rstrip() + "..."
+
     def _is_interactive_user_authorized(
         self,
         user_id: str,
@@ -3262,7 +3276,9 @@ class SlackAdapter(BasePlatformAdapter):
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": original_text or "Confirmation prompt",
+                    "text": self._truncate_section_block_text(
+                        original_text or "Confirmation prompt"
+                    ),
                 },
             },
             {
@@ -3384,7 +3400,9 @@ class SlackAdapter(BasePlatformAdapter):
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": original_text or "Command approval request",
+                    "text": self._truncate_section_block_text(
+                        original_text or "Command approval request"
+                    ),
                 },
             },
             {
