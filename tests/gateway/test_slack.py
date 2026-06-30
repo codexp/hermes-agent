@@ -2015,6 +2015,22 @@ class TestMessageRouting:
         await adapter._handle_slack_message(event)
         adapter.handle_message.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_slack_channel_rename_notices_ignored(self, adapter):
+        """Slack-generated channel rename notices should not reach the agent."""
+        event = {
+            "text": "renamed the channel from “agent-brodge” to “skill-agent-bridge”",
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "ts": "1234567890.000002",
+            "subtype": "channel_name",
+            "old_name": "agent-brodge",
+            "name": "skill-agent-bridge",
+        }
+        await adapter._handle_slack_message(event)
+        adapter.handle_message.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # TestSendTyping — assistant.threads.setStatus

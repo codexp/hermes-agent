@@ -2424,9 +2424,28 @@ class SlackAdapter(BasePlatformAdapter):
             if msg_user and self._bot_user_id and msg_user == self._bot_user_id:
                 return
 
-        # Ignore message edits and deletions
+        # Ignore message edits, deletions, and Slack-generated channel
+        # lifecycle notices.  Slack emits channel renames as message events
+        # with subtype="channel_name" and human-looking text such as
+        # "Renamed the channel from ..."; those should not reach the agent.
         subtype = event.get("subtype")
-        if subtype in {"message_changed", "message_deleted"}:
+        if subtype in {
+            "message_changed",
+            "message_deleted",
+            "channel_name",
+            "channel_join",
+            "channel_leave",
+            "channel_topic",
+            "channel_purpose",
+            "channel_archive",
+            "channel_unarchive",
+            "group_join",
+            "group_leave",
+            "group_topic",
+            "group_purpose",
+            "group_archive",
+            "group_unarchive",
+        }:
             return
 
         original_text = event.get("text", "")
