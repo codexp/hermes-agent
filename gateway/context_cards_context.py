@@ -4,7 +4,7 @@
 Update obligation for agents: when changing this script's storage layout,
 command surface, render order, or frontmatter behavior, also update the design
 canvas at:
-  /home/ewe/Dokumente/eos-vault/Hermes/Hermes Gateway Context Cards.md
+  /home/ewe/Dokumente/eos-vault/Hermes/Gateway Context Cards.md
 
 This script is intentionally deterministic and low-level. Gateway command
 handling may preprocess or intelligently normalize content, then call this
