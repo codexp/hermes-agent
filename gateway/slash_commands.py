@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import hashlib
+import html
 import inspect
 import logging
 import os
@@ -28,6 +29,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Union, cast
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
@@ -651,11 +653,18 @@ class GatewaySlashCommandsMixin:
         import subprocess
 
         source = event.source
-        args = shlex.split(event.get_command_args().strip()) if event.get_command_args().strip() else []
-        if not args:
-            args = ["get"]
-        sub = args[0].lower()
-        rest = args[1:]
+        raw_args = event.get_command_args().strip()
+        if raw_args:
+            sub, sep, rest_text = raw_args.partition(" ")
+            sub = sub.lower()
+            rest_text = rest_text.strip() if sep else ""
+        else:
+            sub = "get"
+            rest_text = ""
+        try:
+            rest = shlex.split(rest_text) if rest_text else []
+        except ValueError as exc:
+            return f"/subject parse error: `{exc}`"
 
         platform = source.platform.value if source.platform else "local"
         # Workspace scopes must not fall back to the channel ID. Slack events
@@ -691,17 +700,26 @@ class GatewaySlashCommandsMixin:
             )
 
         def _code_fence(text: str) -> str:
-            text = (text or "").rstrip()
-            return f"```md\n{text}\n```" if text else "```md\n\n```"
+            text = text or ""
+            if text and not text.endswith("\n"):
+                text += "\n"
+            # Slack renders language tags in triple-backtick blocks as literal
+            # content (for example, a visible `md` line), so gateway command
+            # replies use plain fences.
+            return f"```\n{text}```" if text else "```\n\n```"
 
         def _normalize_description(text: str) -> str:
             # Keep v0 conservative: trim whitespace and collapse spaces. Do not
             # expand terse user wording. Future agent-side preprocessing can do
             # richer grammar fixes before calling the low-level script.
-            return re.sub(r"\\s+", " ", text.strip())
+            return re.sub(r"\s+", " ", text.strip())
 
-        resource_re = re.compile(r"^(jira|github|gh|path|home|url|urn|obsidian):(.+)$", re.IGNORECASE)
+        resource_prefixes = ("jira", "github", "gh", "path", "home", "url", "urn", "obsidian")
+        resource_prefix_pattern = "|".join(resource_prefixes)
+        resource_re = re.compile(rf"^({resource_prefix_pattern}):(.+)$", re.IGNORECASE)
+        inline_resource_re = re.compile(rf"\b({resource_prefix_pattern}):", re.IGNORECASE)
         skill_re = re.compile(r"^skill:\s*`?([^`\s]+)`?\s*$", re.IGNORECASE)
+        scope_type_re = re.compile(r"^(?:type|scope_type):\s*`?([^`\s]+)`?\s*$", re.IGNORECASE)
         legacy_section_keys = {
             "Skills:": "skills",
             "Tools:": "tools",
@@ -711,26 +729,205 @@ class GatewaySlashCommandsMixin:
         }
         frontmatter_order = ["scope_type", "include", "skills", "tools", "toolsets", "resources"]
 
+        def _unwrap_grouping_backticks(value: str) -> str:
+            if value.startswith("`"):
+                value = value[1:]
+                if value.endswith("`"):
+                    value = value[:-1]
+            return value
+
+        def _obsidian_uri_from_note(note: str, *, vault: str = "eos-vault") -> str | None:
+            note = html.unescape(note.strip().strip("<>").strip())
+            if not note:
+                return None
+            if note.startswith("obsidian://"):
+                return _obsidian_resource_from_url(note)
+            if note.endswith(".md"):
+                note = note[:-3]
+            vault_paths = [
+                Path(os.environ.get("OBSIDIAN_VAULT_PATH", "")).expanduser() if os.environ.get("OBSIDIAN_VAULT_PATH") else None,
+                Path.home() / "Dokumente" / vault,
+                Path.home() / "Documents" / "Obsidian Vault",
+            ]
+            if "/" not in note:
+                target_name = f"{note}.md"
+                for vault_path in [path for path in vault_paths if path and path.exists()]:
+                    matches = sorted(vault_path.rglob(target_name))
+                    if matches:
+                        note = matches[0].relative_to(vault_path).with_suffix("").as_posix()
+                        break
+                else:
+                    first, sep, rest = note.partition(" ")
+                    if sep and any((path / first).is_dir() for path in vault_paths if path and path.exists()):
+                        note = f"{first}/{rest}"
+            file_param = quote(note, safe="")
+            return f"obsidian://open?vault={quote(vault, safe='')}&file={file_param}"
+
+        def _obsidian_resource_from_url(value: str) -> str | None:
+            candidate = html.unescape(value.strip().strip("<>").strip())
+            candidate = re.split(r"\s+", candidate, maxsplit=1)[0].strip("()")
+            if not candidate.startswith("obsidian://"):
+                return None
+            parsed = urlparse(candidate)
+            params = parse_qs(parsed.query)
+            file_values = params.get("file")
+            if not file_values:
+                return None
+            note = unquote(file_values[0]).strip().strip("/")
+            if not note:
+                return None
+            if not note.endswith(".md"):
+                note_for_uri = note
+            else:
+                note_for_uri = note[:-3]
+            vault = params.get("vault", ["eos-vault"])[0] or "eos-vault"
+            return f"obsidian://open?vault={quote(vault, safe='')}&file={quote(note_for_uri, safe='')}"
+
+        def _normalize_resource(value: str) -> str | None:
+            match = resource_re.match(value.strip())
+            if not match:
+                return None
+            prefix = match.group(1).lower()
+            raw_value = _unwrap_grouping_backticks(match.group(2))
+            obsidian_candidate = f"obsidian:{raw_value}" if prefix == "obsidian" and raw_value.startswith("//") else raw_value
+            obsidian_resource = _obsidian_resource_from_url(obsidian_candidate)
+            if obsidian_resource and prefix in {"obsidian", "urn", "url"}:
+                return obsidian_resource
+            if prefix == "obsidian":
+                obsidian_resource = _obsidian_uri_from_note(raw_value)
+                if obsidian_resource:
+                    return obsidian_resource
+            if not raw_value:
+                return None
+            return f"{prefix}:{raw_value}"
+
+        def _resource_dedupe_key(value: str) -> str:
+            return _normalize_resource(value) or value.strip()
+
+        def _extract_inline_resources(desc: str) -> tuple[list[str], str]:
+            resources: list[str] = []
+            title_parts: list[str] = []
+            pos = 0
+            while True:
+                match = inline_resource_re.search(desc, pos)
+                if not match:
+                    break
+                before = desc[pos:match.start()].strip()
+                if before:
+                    title_parts.append(before)
+                prefix = match.group(1).lower()
+                value_start = match.end()
+                if value_start < len(desc) and desc[value_start] == "`":
+                    end = desc.find("`", value_start + 1)
+                    if end == -1:
+                        # Unmatched grouping delimiter: do not consume a partial resource.
+                        title_parts.append(desc[match.start():].strip())
+                        pos = len(desc)
+                        break
+                    raw_value = desc[value_start + 1:end]
+                    pos = end + 1
+                else:
+                    value_match = re.match(r"\S+", desc[value_start:])
+                    if not value_match:
+                        pos = value_start
+                        continue
+                    raw_value = value_match.group(0).strip()
+                    pos = value_start + len(raw_value)
+                resource = _normalize_resource(f"{prefix}:{raw_value}")
+                if resource and resource not in resources:
+                    resources.append(resource)
+            tail = desc[pos:].strip()
+            if tail:
+                title_parts.append(tail)
+            return resources, _normalize_description(" ".join(title_parts))
+
+        def _extract_inline_scope_type(desc: str) -> tuple[str | None, str]:
+            scope_type: str | None = None
+            title_parts: list[str] = []
+            pattern = re.compile(r"\b(?:type|scope_type):", re.IGNORECASE)
+            if not pattern.search(desc):
+                return None, desc
+            pos = 0
+            while True:
+                match = pattern.search(desc, pos)
+                if not match:
+                    break
+                before = desc[pos:match.start()].strip()
+                if before:
+                    title_parts.append(before)
+                value_start = match.end()
+                if value_start < len(desc) and desc[value_start] == "`":
+                    end = desc.find("`", value_start + 1)
+                    if end == -1:
+                        title_parts.append(desc[match.start():].strip())
+                        pos = len(desc)
+                        break
+                    raw_value = desc[value_start + 1:end].strip()
+                    pos = end + 1
+                else:
+                    value_match = re.match(r"\S+", desc[value_start:])
+                    if not value_match:
+                        pos = value_start
+                        continue
+                    raw_value = value_match.group(0).strip().strip("`")
+                    pos = value_start + len(value_match.group(0))
+                if raw_value and scope_type is None:
+                    scope_type = raw_value
+            tail = desc[pos:].strip()
+            if tail:
+                title_parts.append(tail)
+            return scope_type, _normalize_description(" ".join(title_parts))
+
+        def _is_deterministic_resource_description(description: str) -> bool:
+            desc = description.strip()
+            return bool(re.fullmatch(r"[A-Z][A-Z0-9]+-\d+", desc) or _normalize_resource(desc))
+
+        def _resource_title(resource: str) -> str:
+            obsidian_resource = _obsidian_resource_from_url(resource)
+            if obsidian_resource:
+                params = parse_qs(urlparse(obsidian_resource).query)
+                file_value = unquote(params.get("file", [""])[0]).strip("/")
+                value = file_value.rsplit("/", 1)[-1]
+                return _normalize_description(value)
+            match = resource_re.match(resource)
+            value = match.group(2) if match else resource
+            value = value.rstrip("/")
+            if "/" in value:
+                value = value.rsplit("/", 1)[-1]
+            if value.endswith(".md"):
+                value = value[:-3]
+            jira = re.fullmatch(r"[A-Z][A-Z0-9]+-\d+", value)
+            return jira.group(0) if jira else _normalize_description(value)
+
         def _resource_from_line(line: str) -> str | None:
             line = line.strip()
             if re.fullmatch(r"[A-Z][A-Z0-9]+-\d+", line):
                 return f"jira:{line}"
-            return line if resource_re.match(line) else None
+            return _normalize_resource(line)
 
         def _skill_from_line(line: str) -> str | None:
             match = skill_re.match(line.strip())
+            return match.group(1) if match else None
+
+        def _scope_type_from_line(line: str) -> str | None:
+            match = scope_type_re.match(line.strip())
             return match.group(1) if match else None
 
         def _empty_card() -> dict[str, Any]:
             return {"meta": {}, "body": []}
 
         def _add_meta(meta: dict[str, Any], key: str, value: str) -> None:
-            value = value.strip().strip("`")
+            value = value.strip()
+            if key == "resources":
+                value = _normalize_resource(value) or value
             if not value:
                 return
             values = meta.setdefault(key, [])
-            if isinstance(values, list) and value not in values:
-                values.append(value)
+            if isinstance(values, list):
+                dedupe_key = _resource_dedupe_key(value) if key == "resources" else value
+                existing_keys = {_resource_dedupe_key(str(item)) if key == "resources" else str(item) for item in values}
+                if dedupe_key not in existing_keys:
+                    values.append(value)
 
         def _parse_frontmatter(raw: str) -> tuple[dict[str, Any], str]:
             if not raw.startswith("---\n"):
@@ -824,35 +1021,31 @@ class GatewaySlashCommandsMixin:
             return content.rstrip() + "\n" if content.strip() else ""
 
         def _card_from_description(description: str) -> str:
-            desc = _normalize_description(description)
+            raw_desc = description.strip()
+            inline_scope_type, desc_without_scope = _extract_inline_scope_type(raw_desc)
+            subject_desc = desc_without_scope or raw_desc
+            desc = _normalize_description(subject_desc)
             card = _empty_card()
-            jira = re.fullmatch(r"[A-Z][A-Z0-9]+-\d+", desc)
+            if inline_scope_type:
+                card["meta"]["scope_type"] = inline_scope_type
+            jira = re.fullmatch(r"[A-Z][A-Z0-9]+-\d+", subject_desc)
             if jira:
                 key = jira.group(0)
                 card["body"] = [f"# {key}"]
                 _add_meta(card["meta"], "resources", f"jira:{key}")
                 return _render_card(card)
 
-            resources: list[str] = []
-            title_parts: list[str] = []
-            last = 0
-            for match in re.finditer(r"\b(jira|github|gh|path|home|url|urn|obsidian):(\S+)", desc, flags=re.IGNORECASE):
-                before = desc[last:match.start()].strip()
-                if before:
-                    title_parts.append(before)
-                resource = match.group(0)
-                if resource not in resources:
-                    resources.append(resource)
-                last = match.end()
-            tail = desc[last:].strip()
-            if tail:
-                title_parts.append(tail)
+            resource_only = _normalize_resource(subject_desc)
+            if resource_only:
+                title = _resource_title(resource_only)
+                if title:
+                    card["body"] = [f"# {title}"]
+                _add_meta(card["meta"], "resources", resource_only)
+                return _render_card(card)
 
-            title = _normalize_description(" ".join(title_parts))
+            resources, title = _extract_inline_resources(subject_desc)
             if not title and len(resources) == 1:
-                jira_resource = re.fullmatch(r"jira:([A-Z][A-Z0-9]+-\d+)", resources[0])
-                if jira_resource:
-                    title = jira_resource.group(1)
+                title = _resource_title(resources[0])
             if not title:
                 title = desc
             if title:
@@ -866,6 +1059,7 @@ class GatewaySlashCommandsMixin:
             updated: str,
             *,
             preserve_existing_resources: bool = True,
+            prefer_existing_body: bool = False,
         ) -> str:
             existing_card = _parse_card(existing)
             updated_card = _parse_card(updated)
@@ -874,61 +1068,95 @@ class GatewaySlashCommandsMixin:
             merged_meta = dict(existing_meta)
             for key, value in updated_meta.items():
                 if key == "resources" and preserve_existing_resources:
-                    merged_meta[key] = list(value) if isinstance(value, list) else value
+                    merged_meta[key] = []
+                    for item in value if isinstance(value, list) else [value]:
+                        _add_meta(merged_meta, "resources", str(item))
                     for item in existing_meta.get("resources", []) if isinstance(existing_meta.get("resources"), list) else []:
                         _add_meta(merged_meta, "resources", str(item))
                 else:
                     merged_meta[key] = value
             if not preserve_existing_resources and "resources" in existing_meta and "resources" not in updated_meta:
                 merged_meta.pop("resources", None)
-            body = updated_card["body"] or existing_card["body"]
+            if prefer_existing_body and existing_card["body"]:
+                body = existing_card["body"]
+            else:
+                body = updated_card["body"] or existing_card["body"]
             return _render_card({"meta": merged_meta, "body": body})
 
         def _add_to_card(existing: str, line: str) -> str:
-            line = _normalize_description(line)
-            if not line:
+            raw_line = line.strip()
+            if not raw_line:
                 return _render_card(_parse_card(existing))
-            if not (existing or "").strip():
-                return _card_from_description(line)
             card = _parse_card(existing)
             meta = card["meta"]
-            skill = _skill_from_line(line)
+            scope_type = _scope_type_from_line(raw_line)
+            if scope_type:
+                meta["scope_type"] = scope_type
+                return _render_card(card)
+            if not (existing or "").strip():
+                return _card_from_description(raw_line)
+            skill = _skill_from_line(raw_line)
             if skill:
                 _add_meta(meta, "skills", skill)
                 return _render_card(card)
-            resource = _resource_from_line(line)
+            resource = _resource_from_line(raw_line)
             if resource:
                 _add_meta(meta, "resources", resource)
                 return _render_card(card)
+            line = _normalize_description(raw_line)
             body = card["body"]
             if isinstance(body, list) and not any(str(l).strip() == line for l in body):
                 body.append(line)
             return _render_card(card)
 
         def _remove_from_card(existing: str, line: str) -> str:
-            line = _normalize_description(line)
-            if not line or not (existing or "").strip():
+            raw_line = line.strip()
+            if not raw_line or not (existing or "").strip():
                 return _render_card(_parse_card(existing))
             card = _parse_card(existing)
             meta = card["meta"]
-            skill = _skill_from_line(line)
+            scope_type = _scope_type_from_line(raw_line)
+            if scope_type:
+                if meta.get("scope_type") == scope_type:
+                    meta.pop("scope_type", None)
+                return _render_card(card)
+            skill = _skill_from_line(raw_line)
             if skill:
                 skills = meta.get("skills") if isinstance(meta.get("skills"), list) else []
                 meta["skills"] = [existing_skill for existing_skill in skills if existing_skill != skill]
                 if not meta["skills"]:
                     meta.pop("skills", None)
                 return _render_card(card)
-            resource = _resource_from_line(line)
+            resource = _resource_from_line(raw_line)
             if resource:
                 resources = meta.get("resources") if isinstance(meta.get("resources"), list) else []
-                meta["resources"] = [existing_resource for existing_resource in resources if existing_resource != resource]
+                remove_key = _resource_dedupe_key(resource)
+                meta["resources"] = [
+                    existing_resource
+                    for existing_resource in resources
+                    if _resource_dedupe_key(str(existing_resource)) != remove_key
+                ]
                 if not meta["resources"]:
                     meta.pop("resources", None)
                 return _render_card(card)
             body = card["body"]
+            line = _normalize_description(raw_line)
             if isinstance(body, list):
                 card["body"] = [body_line for body_line in body if str(body_line).strip() != line]
             return _render_card(card)
+
+        def _metadata_remove_keys_from_instruction(instruction: str) -> set[str]:
+            lowered = instruction.lower()
+            remove_verb = r"(?:remove|delete|drop|clear|unset)"
+            patterns = {
+                "skills": rf"\b{remove_verb}\s+(?:all\s+|the\s+)?skills?\b",
+                "tools": rf"\b{remove_verb}\s+(?:all\s+|the\s+)?tools?\b",
+                "toolsets": rf"\b{remove_verb}\s+(?:all\s+|the\s+)?toolsets?\b",
+                "resources": rf"\b{remove_verb}\s+(?:all\s+)?resources?\b",
+                "include": rf"\b{remove_verb}\s+(?:all\s+|the\s+)?includes?\b",
+                "scope_type": rf"\b{remove_verb}\s+(?:the\s+)?(?:scope_type|scope type|type)\b",
+            }
+            return {key for key, pattern in patterns.items() if re.search(pattern, lowered)}
 
         if sub == "get":
             scope_only = "--scope" in rest
@@ -938,7 +1166,7 @@ class GatewaySlashCommandsMixin:
                 return f"/subject get failed: `{(proc.stderr or proc.stdout).strip()}`"
             if not (proc.stdout or "").strip():
                 return "Context file not found"
-            output = _render_card(_parse_card(proc.stdout)) if scope_only else proc.stdout
+            output = proc.stdout
             return _code_fence(output)
 
         if sub == "clear":
@@ -957,26 +1185,39 @@ class GatewaySlashCommandsMixin:
             return "Subject card cleared."
 
         if sub == "set":
-            description = " ".join(rest).strip()
+            description = rest_text.strip()
             if not description:
                 return "Usage: /subject set <description>"
             get_proc = await asyncio.to_thread(_run_context, ["get", "--scope", *scope_args])
             if get_proc.returncode != 0:
                 return f"/subject set failed: `{(get_proc.stderr or get_proc.stdout).strip()}`"
-            fallback_content = _merge_card_update(get_proc.stdout, _card_from_description(description))
-            preprocessed = await self._preprocess_subject_card_with_agent(
-                event,
-                description,
-                fallback_content,
+            generated_content = _add_to_card(get_proc.stdout, description) if _scope_type_from_line(description) else _card_from_description(description)
+            deterministic_resource = _is_deterministic_resource_description(description) or bool(_scope_type_from_line(description))
+            fallback_content = _merge_card_update(
+                get_proc.stdout,
+                generated_content,
+                prefer_existing_body=deterministic_resource,
             )
-            content = _merge_card_update(get_proc.stdout, preprocessed)
+            if deterministic_resource:
+                preprocessed = fallback_content
+            else:
+                preprocessed = await self._preprocess_subject_card_with_agent(
+                    event,
+                    description,
+                    fallback_content,
+                )
+            content = _merge_card_update(
+                get_proc.stdout,
+                preprocessed,
+                prefer_existing_body=deterministic_resource,
+            )
             proc = await asyncio.to_thread(_run_context, ["set", *scope_args, "--", content])
             if proc.returncode != 0:
                 return f"/subject set failed: `{(proc.stderr or proc.stdout).strip()}`"
             return _code_fence(content)
 
         if sub == "update":
-            instruction = " ".join(rest).strip()
+            instruction = rest_text.strip()
             if not instruction:
                 return "Usage: /subject update <instruction>"
             get_proc = await asyncio.to_thread(_run_context, ["get", "--scope", *scope_args])
@@ -989,13 +1230,19 @@ class GatewaySlashCommandsMixin:
                 fallback_content,
             )
             content = _merge_card_update(get_proc.stdout, preprocessed, preserve_existing_resources=False)
+            remove_meta_keys = _metadata_remove_keys_from_instruction(instruction)
+            if remove_meta_keys:
+                card = _parse_card(content)
+                for key in remove_meta_keys:
+                    card["meta"].pop(key, None)
+                content = _render_card(card)
             set_proc = await asyncio.to_thread(_run_context, ["set", *scope_args, "--", content])
             if set_proc.returncode != 0:
                 return f"/subject update failed: `{(set_proc.stderr or set_proc.stdout).strip()}`"
             return _code_fence(content)
 
         if sub == "add":
-            line = " ".join(rest).strip()
+            line = rest_text.strip()
             if not line:
                 return "Usage: /subject add {type}:{value}"
             get_proc = await asyncio.to_thread(_run_context, ["get", "--scope", *scope_args])
@@ -1005,10 +1252,13 @@ class GatewaySlashCommandsMixin:
             set_proc = await asyncio.to_thread(_run_context, ["set", *scope_args, "--", content])
             if set_proc.returncode != 0:
                 return f"/subject add failed: `{(set_proc.stderr or set_proc.stdout).strip()}`"
-            return _code_fence(content)
+            full_proc = await asyncio.to_thread(_run_context, ["get", *scope_args])
+            if full_proc.returncode != 0:
+                return f"/subject add failed: `{(full_proc.stderr or full_proc.stdout).strip()}`"
+            return _code_fence(full_proc.stdout)
 
         if sub in {"remove", "unset"}:
-            line = " ".join(rest).strip()
+            line = rest_text.strip()
             if not line:
                 return f"Usage: /subject {sub} {{type}}:{{value}}"
             get_proc = await asyncio.to_thread(_run_context, ["get", "--scope", *scope_args])
@@ -1018,7 +1268,10 @@ class GatewaySlashCommandsMixin:
             set_proc = await asyncio.to_thread(_run_context, ["set", *scope_args, "--", content])
             if set_proc.returncode != 0:
                 return f"/subject {sub} failed: `{(set_proc.stderr or set_proc.stdout).strip()}`"
-            return _code_fence(content)
+            full_proc = await asyncio.to_thread(_run_context, ["get", *scope_args])
+            if full_proc.returncode != 0:
+                return f"/subject {sub} failed: `{(full_proc.stderr or full_proc.stdout).strip()}`"
+            return _code_fence(full_proc.stdout)
 
         return "Usage: /subject [get [--scope] | set <description> | update <instruction> | add {type}:{value} | remove {type}:{value} | unset {type}:{value} | clear]"
 

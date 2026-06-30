@@ -37,7 +37,7 @@ def hermes_home(tmp_path, monkeypatch):
     home = tmp_path / "hermes"
     script_dir = home / "gateway-context" / "script"
     script_dir.mkdir(parents=True)
-    src = Path.home() / ".hermes" / "gateway-context" / "script" / "context"
+    src = Path(__file__).parents[2] / "gateway" / "context_cards_context.py"
     dst = script_dir / "context"
     shutil.copy2(src, dst)
     dst.chmod(0o755)
@@ -65,6 +65,29 @@ def _event(
             thread_id=thread_id,
         ),
     )
+
+
+def test_context_set_and_get_scope_preserve_exact_content_bytes(hermes_home):
+    script = hermes_home / "gateway-context" / "script" / "context"
+    raw = "  # Exact\n\nBody with trailing blanks   \n\n"
+
+    set_proc = subprocess.run(
+        [str(script), "set", "slack", "T123", "C0BB6UUEQHM", "1781871116.838719"],
+        input=raw,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert set_proc.returncode == 0
+
+    get_proc = subprocess.run(
+        [str(script), "get", "--scope", "slack", "T123", "C0BB6UUEQHM", "1781871116.838719"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert get_proc.returncode == 0
+    assert get_proc.stdout == raw
 
 
 @pytest.mark.asyncio
@@ -223,7 +246,7 @@ async def test_setup_infers_shop_scope_and_preserves_existing_resources(hermes_h
 async def test_subject_set_jira_key_creates_thread_card(hermes_home):
     result = await SubjectHarness()._handle_subject_command(_event("/subject set MODS-12345"))
 
-    expected = "```md\n---\nresources:\n  - jira:MODS-12345\n---\n\n# MODS-12345\n```"
+    expected = "```\n---\nresources:\n  - jira:MODS-12345\n---\n\n# MODS-12345\n```"
     assert result == expected
     card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "1781871116.838719.md"
     assert card.read_text() == "---\nresources:\n  - jira:MODS-12345\n---\n\n# MODS-12345\n"
@@ -233,7 +256,123 @@ async def test_subject_set_jira_key_creates_thread_card(hermes_home):
 async def test_subject_set_typed_jira_resource_uses_issue_key_title(hermes_home):
     result = await SubjectHarness()._handle_subject_command(_event("/subject set jira:FB2B-1812"))
 
-    assert result == "```md\n---\nresources:\n  - jira:FB2B-1812\n---\n\n# FB2B-1812\n```"
+    assert result == "```\n---\nresources:\n  - jira:FB2B-1812\n---\n\n# FB2B-1812\n```"
+
+
+@pytest.mark.asyncio
+async def test_subject_set_obsidian_resource_with_backtick_spaces(hermes_home):
+    result = await SubjectHarness()._handle_subject_command(
+        _event("/subject set obsidian:`Projects/Seidensticker/SEID-2785 Size filter mapping.md`")
+    )
+
+    assert result == (
+        "```\n"
+        "---\n"
+        "resources:\n"
+        "  - obsidian://open?vault=eos-vault&file=Projects%2FSeidensticker%2FSEID-2785%20Size%20filter%20mapping\n"
+        "---\n\n"
+        "# SEID-2785 Size filter mapping\n"
+        "```"
+    )
+
+
+@pytest.mark.asyncio
+async def test_subject_typed_resource_preserves_internal_whitespace_inside_backticks(hermes_home):
+    result = await SubjectHarness()._handle_subject_command(_event("/subject set obsidian:`Projects/Foo  Bar.md`"))
+
+    assert "  - obsidian://open?vault=eos-vault&file=Projects%2FFoo%20%20Bar" in result
+    assert "  - obsidian:Projects/Foo Bar.md" not in result
+
+    added = await SubjectHarness()._handle_subject_command(_event("/subject add obsidian:`Projects/Baz  Qux.md`"))
+    assert "  - obsidian://open?vault=eos-vault&file=Projects%2FBaz%20%20Qux" in added
+
+
+@pytest.mark.asyncio
+async def test_subject_set_obsidian_resource_without_backticks_keeps_spaces(hermes_home):
+    result = await SubjectHarness()._handle_subject_command(
+        _event("/subject set obsidian://open?vault=eos-vault&file=Projects%2FSeidensticker%2FSEID-2785%20Size%20filter%20mapping")
+    )
+
+    assert result == (
+        "```\n"
+        "---\n"
+        "resources:\n"
+        "  - obsidian://open?vault=eos-vault&file=Projects%2FSeidensticker%2FSEID-2785%20Size%20filter%20mapping\n"
+        "---\n\n"
+        "# SEID-2785 Size filter mapping\n"
+        "```"
+    )
+
+
+@pytest.mark.asyncio
+async def test_subject_set_obsidian_resource_preserves_existing_thread_body_and_cleans_malformed_duplicate(
+    hermes_home,
+):
+    harness = SubjectHarness()
+    channel_card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "MAIN.md"
+    thread_card = channel_card.parent / "1781871116.838719.md"
+    channel_card.parent.mkdir(parents=True)
+    channel_content = "---\nresources:\n  - gh:even-on-sunday/seidensticker-b2c-shop\n---\n\n# Channel body\n"
+    channel_card.write_text(channel_content, encoding="utf-8")
+    thread_card.write_text(
+        "---\n"
+        "resources:\n"
+        "  - obsidian:`Projects/Seidensticker/SEID-2785 Size filter mapping.md\n"
+        "---\n\n"
+        "# Existing thread body\n\n"
+        "Keep this note.\n",
+        encoding="utf-8",
+    )
+
+    result = await harness._handle_subject_command(
+        _event("/subject set obsidian:`Projects/Seidensticker/SEID-2785 Size filter mapping.md`")
+    )
+
+    expected = (
+        "---\n"
+        "resources:\n"
+        "  - obsidian://open?vault=eos-vault&file=Projects%2FSeidensticker%2FSEID-2785%20Size%20filter%20mapping\n"
+        "---\n\n"
+        "# Existing thread body\n"
+        "\n"
+        "Keep this note.\n"
+    )
+    assert result == f"```\n{expected.rstrip()}\n```"
+    assert thread_card.read_text(encoding="utf-8") == expected
+    assert channel_card.read_text(encoding="utf-8") == channel_content
+
+
+@pytest.mark.asyncio
+async def test_subject_add_and_remove_obsidian_resource_with_backtick_spaces(hermes_home):
+    harness = SubjectHarness()
+    await harness._handle_subject_command(_event("/subject set Existing thread", thread_id="1781871116.838719"))
+
+    added = await harness._handle_subject_command(
+        _event("/subject add obsidian:`Projects/Seidensticker/SEID-2785 Size filter mapping.md`")
+    )
+    assert "  - obsidian://open?vault=eos-vault&file=Projects%2FSeidensticker%2FSEID-2785%20Size%20filter%20mapping" in added
+
+    removed = await harness._handle_subject_command(
+        _event("/subject remove obsidian:`Projects/Seidensticker/SEID-2785 Size filter mapping.md`")
+    )
+    assert removed == "```\n# Existing thread\n```"
+
+
+@pytest.mark.asyncio
+async def test_subject_set_inline_backtick_resource_extracts_complete_value(hermes_home):
+    result = await SubjectHarness()._handle_subject_command(
+        _event("/subject set See obsidian:`Projects/Seidensticker/SEID-2785 Size filter mapping.md` for mapping")
+    )
+
+    assert "  - obsidian://open?vault=eos-vault&file=Projects%2FSeidensticker%2FSEID-2785%20Size%20filter%20mapping" in result
+    assert "# See for mapping" in result
+
+
+@pytest.mark.asyncio
+async def test_subject_parse_error_for_unmatched_quotes(hermes_home):
+    result = await SubjectHarness()._handle_subject_command(_event('/subject get "unterminated'))
+
+    assert result == "/subject parse error: `No closing quotation`"
 
 
 @pytest.mark.asyncio
@@ -243,7 +382,7 @@ async def test_subject_set_extracts_inline_resources(hermes_home):
     )
 
     expected = (
-        "```md\n"
+        "```\n"
         "---\n"
         "resources:\n"
         "  - home:~/devel/falke-b2b-shop/\n"
@@ -256,12 +395,56 @@ async def test_subject_set_extracts_inline_resources(hermes_home):
 
 
 @pytest.mark.asyncio
+async def test_subject_type_without_set_is_usage_not_mutation(hermes_home):
+    harness = SubjectHarness()
+    await harness._handle_subject_command(_event("/subject set Gateway Context Skill", thread_id=None))
+
+    result = await harness._handle_subject_command(_event("/subject type:hermes-skill", thread_id=None))
+
+    assert result == (
+        "Usage: /subject [get [--scope] | set <description> | update <instruction> | "
+        "add {type}:{value} | remove {type}:{value} | unset {type}:{value} | clear]"
+    )
+    card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "MAIN.md"
+    assert card.read_text(encoding="utf-8") == "# Gateway Context Skill\n"
+
+
+@pytest.mark.asyncio
+async def test_subject_set_type_updates_scope_type_not_skill(hermes_home):
+    harness = SubjectHarness()
+    card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "MAIN.md"
+    card.parent.mkdir(parents=True)
+    card.write_text(
+        "---\n"
+        "scope_type: eos-shop\n"
+        "resources:\n"
+        "  - path:/home/ewe/devel/my-project\n"
+        "  - gh:org/repo\n"
+        "---\n\n"
+        "# Old title\n",
+        encoding="utf-8",
+    )
+
+    result = await harness._handle_subject_command(_event("/subject set Gateway Context Skill type:hermes-skill", thread_id=None))
+
+    assert "scope_type: hermes-skill" in result
+    assert "skills:" not in result
+    assert "# Gateway Context Skill" in result
+    text = card.read_text(encoding="utf-8")
+    assert "scope_type: hermes-skill" in text
+    assert "skills:" not in text
+    assert "  - path:/home/ewe/devel/my-project" in text
+    assert "  - gh:org/repo" in text
+    assert "# Gateway Context Skill" in text
+
+
+@pytest.mark.asyncio
 async def test_subject_set_uses_agent_preprocessed_card(hermes_home):
     harness = SubjectPreprocessHarness("# Hermes Setup\n")
 
     result = await harness._handle_subject_command(_event("/subject set Hemes Setup", thread_id=None))
 
-    assert result == "```md\n# Hermes Setup\n```"
+    assert result == "```\n# Hermes Setup\n```"
     card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "MAIN.md"
     assert card.read_text() == "# Hermes Setup\n"
 
@@ -272,7 +455,7 @@ async def test_subject_set_rejects_unsafe_agent_preprocessed_card(hermes_home):
 
     result = await harness._handle_subject_command(_event("/subject set Hemes Setup", thread_id=None))
 
-    assert result == "```md\n# Hemes Setup\n```"
+    assert result == "```\n# Hemes Setup\n```"
 
 
 @pytest.mark.asyncio
@@ -336,7 +519,139 @@ async def test_subject_get_defaults_to_resolved_bundle_and_scope_is_local(hermes
     assert "<!--" not in full
     assert "MAIN.md" not in full
     assert full.index("# Thread") < full.index("# Channel") < full.index("# Global") < full.index("# Slack gateway")
-    assert scoped == "```md\n# Thread\n```"
+    assert scoped == "```\n# Thread\n```"
+
+
+@pytest.mark.asyncio
+async def test_subject_get_compiles_frontmatter_for_agent_context(hermes_home):
+    base = hermes_home / "gateway-context"
+    channel_dir = base / "slack" / "T123" / "channel" / "C0BB6UUEQHM"
+    channel_dir.mkdir(parents=True)
+    includes_dir = base / "slack" / "T123" / "includes"
+    includes_dir.mkdir(parents=True)
+    definitions_dir = base / "slack" / "T123" / "definitions" / "scope-types"
+    definitions_dir.mkdir(parents=True)
+    (base / "global.md").write_text(
+        "---\n"
+        "skills:\n"
+        "  - global-skill\n"
+        "resources:\n"
+        "  - url:https://global.example\n"
+        "---\n\n"
+        "# Global\n",
+        encoding="utf-8",
+    )
+    (channel_dir / "MAIN.md").write_text(
+        "---\n"
+        "scope_type: eos-shop\n"
+        "skills:\n"
+        "  - eos-shop-platform\n"
+        "tools:\n"
+        "  - terminal\n"
+        "resources:\n"
+        "  - path:/home/ewe/devel/oui-b2c-shop\n"
+        "include:\n"
+        "  - includes/shop-extra.md\n"
+        "---\n\n"
+        "# Channel\n",
+        encoding="utf-8",
+    )
+    (channel_dir / "1781871116.838719.md").write_text(
+        "---\n"
+        "scope_type: jira-ticket\n"
+        "skills:\n"
+        "  - jira-skill\n"
+        "  - eos-shop-platform\n"
+        "tools:\n"
+        "  - terminal\n"
+        "resources:\n"
+        "  - jira:MODS-1\n"
+        "---\n\n"
+        "# Thread\n",
+        encoding="utf-8",
+    )
+    (includes_dir / "shop-extra.md").write_text(
+        "---\n"
+        "tools:\n"
+        "  - browser\n"
+        "resources:\n"
+        "  - gh:even-on-sunday/oui-b2c-shop\n"
+        "---\n\n"
+        "# Included\n",
+        encoding="utf-8",
+    )
+    (definitions_dir / "jira-ticket.md").write_text(
+        "---\n"
+        "skills:\n"
+        "  - jira-definition-skill\n"
+        "toolsets:\n"
+        "  - terminal\n"
+        "---\n\n"
+        "# Jira ticket definition\n",
+        encoding="utf-8",
+    )
+
+    result = await SubjectHarness()._handle_subject_command(_event("/subject get"))
+
+    assert result == (
+        "```\n"
+        "---\n"
+        "scope_type: jira-ticket\n"
+        "skills:\n"
+        "  - jira-skill\n"
+        "  - eos-shop-platform\n"
+        "  - global-skill\n"
+        "  - jira-definition-skill\n"
+        "tools:\n"
+        "  - terminal\n"
+        "  - browser\n"
+        "toolsets:\n"
+        "  - terminal\n"
+        "resources:\n"
+        "  - jira:MODS-1\n"
+        "  - path:/home/ewe/devel/oui-b2c-shop\n"
+        "  - gh:even-on-sunday/oui-b2c-shop\n"
+        "  - url:https://global.example\n"
+        "---\n\n"
+        "# Thread\n\n\n"
+        "# Channel\n\n\n"
+        "# Global\n\n\n"
+        "# Jira ticket definition\n\n\n"
+        "# Included\n"
+        "```"
+    )
+
+
+@pytest.mark.asyncio
+async def test_subject_get_dedupes_nested_shared_includes(hermes_home):
+    base = hermes_home / "gateway-context"
+    channel_dir = base / "slack" / "T123" / "channel" / "C0BB6UUEQHM"
+    includes_dir = base / "slack" / "T123" / "includes"
+    channel_dir.mkdir(parents=True)
+    includes_dir.mkdir(parents=True)
+    (channel_dir / "MAIN.md").write_text(
+        "---\n"
+        "include:\n"
+        "  - includes/a.md\n"
+        "  - includes/b.md\n"
+        "---\n\n"
+        "# Channel\n",
+        encoding="utf-8",
+    )
+    (includes_dir / "a.md").write_text(
+        "---\ninclude:\n  - includes/shared.md\n---\n\n# Include A\n",
+        encoding="utf-8",
+    )
+    (includes_dir / "b.md").write_text(
+        "---\ninclude:\n  - includes/shared.md\n---\n\n# Include B\n",
+        encoding="utf-8",
+    )
+    (includes_dir / "shared.md").write_text("# Shared\n", encoding="utf-8")
+
+    result = await SubjectHarness()._handle_subject_command(_event("/subject get", thread_id=None))
+
+    assert result.count("# Shared") == 1
+    assert result.index("# Include A") < result.index("# Shared") < result.index("# Include B")
 
 
 @pytest.mark.asyncio
@@ -357,7 +672,7 @@ async def test_subject_add_places_and_deduplicates_resources(hermes_home):
     result = await harness._handle_subject_command(_event("/subject add path:~/devel/oui-b2c-shop"))
 
     assert result == (
-        "```md\n"
+        "```\n"
         "---\n"
         "resources:\n"
         "  - jira:MODS-12345\n"
@@ -366,6 +681,95 @@ async def test_subject_add_places_and_deduplicates_resources(hermes_home):
         "# MODS-12345\n"
         "```"
     )
+
+
+@pytest.mark.asyncio
+async def test_subject_add_returns_full_resolved_context_not_scope_only(hermes_home):
+    harness = SubjectHarness()
+    base = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM"
+    base.mkdir(parents=True)
+    parent = base / "MAIN.md"
+    parent.write_text("# Parent channel context\n", encoding="utf-8")
+    child = base / "1781871116.838719.md"
+    child.write_text("# Thread context\n", encoding="utf-8")
+
+    result = await harness._handle_subject_command(_event("/subject add path:~/devel/hermes-agent"))
+
+    assert result == (
+        "```\n"
+        "---\n"
+        "resources:\n"
+        "  - path:~/devel/hermes-agent\n"
+        "---\n\n"
+        "# Thread context\n\n\n"
+        "# Parent channel context\n"
+        "```"
+    )
+    assert parent.read_text(encoding="utf-8") == "# Parent channel context\n"
+    assert child.read_text(encoding="utf-8") == (
+        "---\n"
+        "resources:\n"
+        "  - path:~/devel/hermes-agent\n"
+        "---\n\n"
+        "# Thread context\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_subject_add_normalizes_obsidian_resources_to_real_uris(hermes_home):
+    vault_note = Path("/home/ewe/Dokumente/eos-vault/Hermes/Gateway Context Cards.md")
+    vault_note.parent.mkdir(parents=True, exist_ok=True)
+    vault_note.touch()
+    harness = SubjectHarness()
+    await harness._handle_subject_command(
+        _event("/subject add urn:<obsidian://open?vault=eos-vault&amp;file=Hermes%2FGateway%20Context%20Cards>")
+    )
+    await harness._handle_subject_command(_event("/subject add obsidian:Hermes Gateway Context Cards.md"))
+    result = await harness._handle_subject_command(
+        _event(
+            "/subject add urn:obsidian://open?vault=eos-vault&file=Hermes%2FGateway%20Context%20Cards "
+            "(obsidian://open?vault=eos-vault&file=Hermes%2FGateway%20Context%20Cards)"
+        )
+    )
+
+    assert result == (
+        "```\n"
+        "---\n"
+        "resources:\n"
+        "  - obsidian://open?vault=eos-vault&file=Hermes%2FGateway%20Context%20Cards\n"
+        "---\n\n"
+        "# Gateway Context Cards\n"
+        "```"
+    )
+
+
+@pytest.mark.asyncio
+async def test_subject_remove_returns_full_resolved_context_not_scope_only(hermes_home):
+    harness = SubjectHarness()
+    base = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM"
+    base.mkdir(parents=True)
+    parent = base / "MAIN.md"
+    parent.write_text("# Parent channel context\n", encoding="utf-8")
+    child = base / "1781871116.838719.md"
+    child.write_text(
+        "---\n"
+        "resources:\n"
+        "  - path:~/devel/hermes-agent\n"
+        "---\n\n"
+        "# Thread context\n",
+        encoding="utf-8",
+    )
+
+    result = await harness._handle_subject_command(_event("/subject remove path:~/devel/hermes-agent"))
+
+    assert result == (
+        "```\n"
+        "# Thread context\n\n\n"
+        "# Parent channel context\n"
+        "```"
+    )
+    assert parent.read_text(encoding="utf-8") == "# Parent channel context\n"
+    assert child.read_text(encoding="utf-8") == "# Thread context\n"
 
 
 @pytest.mark.asyncio
@@ -385,7 +789,7 @@ async def test_subject_add_skill_formats_skills_block_before_resources(hermes_ho
     result = await harness._handle_subject_command(_event("/subject add skill:`eos-shop-platform`"))
 
     assert result == (
-        "```md\n"
+        "```\n"
         "---\n"
         "skills:\n"
         "  - eos-shop-platform\n"
@@ -418,7 +822,7 @@ async def test_subject_add_skill_colon_migrates_legacy_inline_skill(hermes_home)
     result = await harness._handle_subject_command(_event("/subject add skill:eos-shop-platform"))
 
     assert result == (
-        "```md\n"
+        "```\n"
         "---\n"
         "skills:\n"
         "  - eos-shop-platform\n"
@@ -491,7 +895,7 @@ async def test_subject_remove_skill_drops_empty_skills_block(hermes_home):
     result = await harness._handle_subject_command(_event("/subject remove skill:hermes-agent"))
 
     assert result == (
-        "```md\n"
+        "```\n"
         "---\n"
         "resources:\n"
         "  - path:/home/ewe/.hermes/hermes-agent\n"
@@ -514,7 +918,7 @@ async def test_subject_unset_resource_drops_empty_resources_block(hermes_home):
 
     result = await harness._handle_subject_command(_event("/subject unset path:/home/ewe/.hermes/hermes-agent"))
 
-    assert result == "```md\n# Hermes Setup\n```"
+    assert result == "```\n# Hermes Setup\n```"
     assert card.read_text() == "# Hermes Setup\n"
 
 
@@ -531,7 +935,7 @@ async def test_subject_set_preserves_existing_resources(hermes_home):
     result = await harness._handle_subject_command(_event("/subject set Better subject"))
 
     assert result == (
-        "```md\n"
+        "```\n"
         "---\n"
         "skills:\n"
         "  - eos-shop-platform\n"
@@ -554,17 +958,17 @@ async def test_subject_add_preserves_provided_resource_text_and_keeps_resources_
 
     await harness._handle_subject_command(_event("/subject add gh:NousResearch/hermes-agent"))
     await harness._handle_subject_command(_event("/subject add home:~/devel/hermes-agent"))
-    await harness._handle_subject_command(_event("/subject add obsidian:Hermes/Hermes Gateway Context Cards"))
+    await harness._handle_subject_command(_event("/subject add obsidian://open?vault=eos-vault&file=Hermes%2FHermes%20Gateway%20Context%20Cards"))
     result = await harness._handle_subject_command(_event("/subject add url:https://hermes-agent.nousresearch.com/docs"))
 
     assert result == (
-        "```md\n"
+        "```\n"
         "---\n"
         "resources:\n"
         "  - jira:MODS-1\n"
         "  - gh:NousResearch/hermes-agent\n"
         "  - home:~/devel/hermes-agent\n"
-        "  - obsidian:Hermes/Hermes Gateway Context Cards\n"
+        "  - obsidian://open?vault=eos-vault&file=Hermes%2FHermes%20Gateway%20Context%20Cards\n"
         "  - url:https://hermes-agent.nousresearch.com/docs\n"
         "---\n\n"
         "# Existing\n"
@@ -574,14 +978,15 @@ async def test_subject_add_preserves_provided_resource_text_and_keeps_resources_
 
 
 @pytest.mark.asyncio
-async def test_subject_get_migrates_legacy_anchor_label(hermes_home):
+async def test_subject_get_scope_returns_raw_scope_card_without_migration(hermes_home):
     base = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM"
     base.mkdir(parents=True)
-    (base / "1781871116.838719.md").write_text("# Legacy\n\nAnchor:\n  - jira:MODS-1\n", encoding="utf-8")
+    raw = "  # Legacy\n\nAnchor:\n  - jira:MODS-1\n\n"
+    (base / "1781871116.838719.md").write_text(raw, encoding="utf-8")
 
     result = await SubjectHarness()._handle_subject_command(_event("/subject get --scope"))
 
-    assert result == "```md\n---\nresources:\n  - jira:MODS-1\n---\n\n# Legacy\n```"
+    assert result == f"```\n{raw}```"
 
 
 @pytest.mark.asyncio
@@ -592,7 +997,7 @@ async def test_subject_update_uses_preprocessed_card_without_restoring_resources
 
     result = await harness._handle_subject_command(_event("/subject update rename to updated subject"))
 
-    assert result == "```md\n# Updated subject\n```"
+    assert result == "```\n# Updated subject\n```"
 
 
 @pytest.mark.asyncio
@@ -612,5 +1017,36 @@ async def test_subject_update_can_remove_and_deduplicate_resources(hermes_home):
         _event("/subject update remove the jira resource and deduplicate resources")
     )
 
-    assert result == "```md\n---\nresources:\n  - path:/home/ewe/devel/shop\n---\n\n# Existing\n```"
+    assert result == "```\n---\nresources:\n  - path:/home/ewe/devel/shop\n---\n\n# Existing\n```"
     assert card.read_text() == "---\nresources:\n  - path:/home/ewe/devel/shop\n---\n\n# Existing\n"
+
+
+@pytest.mark.asyncio
+async def test_subject_update_remove_skills_drops_existing_metadata_even_if_preprocessor_preserves_it(hermes_home):
+    card = hermes_home / "gateway-context" / "slack" / "T123" / "channel" / "C0BB6UUEQHM" / "1781871116.838719.md"
+    card.parent.mkdir(parents=True)
+    existing = (
+        "---\n"
+        "scope_type: eos-shop\n"
+        "skills:\n"
+        "  - eos-shop-platform\n"
+        "resources:\n"
+        "  - path:/home/ewe/devel/seidensticker-b2c-shop\n"
+        "---\n\n"
+        "# Seidensticker B2C Shop Development\n"
+    )
+    card.write_text(existing, encoding="utf-8")
+    harness = SubjectPreprocessHarness(existing)
+
+    result = await harness._handle_subject_command(_event("/subject update remove skills"))
+
+    expected = (
+        "---\n"
+        "scope_type: eos-shop\n"
+        "resources:\n"
+        "  - path:/home/ewe/devel/seidensticker-b2c-shop\n"
+        "---\n\n"
+        "# Seidensticker B2C Shop Development\n"
+    )
+    assert result == f"```\n{expected}```"
+    assert card.read_text(encoding="utf-8") == expected
